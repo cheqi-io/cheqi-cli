@@ -1,6 +1,6 @@
 {
   "name": "@cheqi/cli",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Cheqi CLI for agent-friendly encrypted receipt workflows",
   "license": "MIT",
   "author": "Cheqi",
