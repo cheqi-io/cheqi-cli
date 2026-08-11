@@ -296,6 +296,16 @@ test("schema is machine readable", async () => {
   assert.equal(schema.commands[0].responseSchema.properties.valid.const, true);
 });
 
+test("runtime version matches package version", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "cheqi-cli-version-"));
+  const result = await execFileAsync(process.execPath, [cli, "version"], { cwd });
+  const envelope = JSON.parse(result.stdout);
+  const packageJson = JSON.parse(await readFile(resolve("package.json"), "utf8"));
+
+  assert.equal(envelope.data.version, packageJson.version);
+  assert.equal(envelope.meta.version, packageJson.version);
+});
+
 test("schema includes positional arguments and response shapes", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "cheqi-cli-schema-shape-"));
   const schema = await run(cwd, ["schema", "receipt", "add-product"]);
