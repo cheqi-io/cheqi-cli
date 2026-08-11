@@ -38,7 +38,7 @@
     "prepublishOnly": "npm test"
   },
   "dependencies": {
-    "@cheqi/sdk": "^0.5.0"
+    "@cheqi/sdk": "^2.2.1"
   },
   "devDependencies": {
     "@types/node": "^25.5.0",
