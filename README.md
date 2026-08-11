@@ -2,7 +2,7 @@
 
 Agent-friendly CLI wrapper around `@cheqi/sdk`.
 
-The CLI uses the SDK 2.2 definitive receipt flow: it resolves a delivery route from the supplied identification details, encrypts the exact merchant-supplied receipt payload for that route, and issues it without a server-side receipt-template step.
+The CLI uses the SDK 2.2.1 definitive receipt flow: it resolves a delivery route from the supplied identification details, encrypts the exact merchant-supplied receipt payload for that route, and issues it without a server-side receipt-template step.
 
 Every command returns a JSON envelope on stdout:
 
@@ -12,7 +12,7 @@ Every command returns a JSON envelope on stdout:
   "data": {},
   "meta": {
     "durationMs": 12,
-    "version": "0.2.0"
+    "version": "0.3.1"
   }
 }
 ```
@@ -32,7 +32,7 @@ Failures use the same shape and include stable error codes:
   },
   "meta": {
     "durationMs": 4,
-    "version": "0.2.0"
+    "version": "0.3.1"
   }
 }
 ```
@@ -54,7 +54,7 @@ cheqi receipt add-product \
 
 cheqi receipt validate --session agent-a
 cheqi receipt preview --session agent-a
-CHEQI_API_KEY=sk_test_... cheqi receipt finalize --session agent-a
+CHEQI_API_KEY=sk_... cheqi receipt finalize --session agent-a
 ```
 
 Drafts are stored locally in `.cheqi/sessions/<session-id>.json`. Sessions are always explicit; pass `--session` on every command so concurrent agents do not share implicit state.
@@ -62,7 +62,7 @@ Drafts are stored locally in `.cheqi/sessions/<session-id>.json`. Sessions are a
 To call the Cheqi matching service before adding products:
 
 ```bash
-CHEQI_API_KEY=sk_test_... cheqi session match \
+CHEQI_API_KEY=sk_... cheqi session match \
   --session agent-a \
   --card-par YOUR_CARD_PAR
 ```
@@ -72,7 +72,7 @@ CHEQI_API_KEY=sk_test_... cheqi session match \
 ## Direct JSON Workflow
 
 ```bash
-CHEQI_API_KEY=sk_test_... npx @cheqi/cli receipts submit \
+CHEQI_API_KEY=sk_... npx @cheqi/cli receipts submit \
   --match-by card_par \
   --match-value YOUR_CARD_PAR \
   --receipt receipt.json
@@ -80,14 +80,14 @@ CHEQI_API_KEY=sk_test_... npx @cheqi/cli receipts submit \
 
 Use `--receipt -` to read the receipt JSON from stdin.
 
-The JSON file must be a definitive SDK 2.2 `ReceiptPayload`. In particular, provide `issueDate`, all receipt totals, `taxesApplied`, and complete product values including `identifier`, `unitCode`, `subtotal`, and `total`. The CLI validates and normalizes the payload but does not infer missing merchant values.
+The JSON file must be a definitive SDK 2.2.1 `ReceiptPayload`. In particular, provide `issueDate`, all receipt totals, `taxesApplied`, and complete product values including `identifier`, `unitCode`, `subtotal`, and `total`. The CLI validates and normalizes the payload but does not infer missing merchant values.
 
 For an anonymous matched flow that should resolve to a download fallback, use `--match-by payment_type --match-value CASH` (or `CARD_PAYMENT` / `DIRECT_DEBIT`).
 
 To create an encrypted download receipt directly, without customer matching:
 
 ```bash
-CHEQI_API_KEY=sk_test_... npx @cheqi/cli receipts submit-download \
+CHEQI_API_KEY=sk_... npx @cheqi/cli receipts submit-download \
   --receipt receipt.json \
   --payment-type CASH
 ```
@@ -122,7 +122,7 @@ Operational responses include a structured `nextStep` when another command is ex
 Use either:
 
 ```bash
-CHEQI_API_KEY=sk_test_...
+CHEQI_API_KEY=sk_...
 ```
 
 or:
@@ -137,12 +137,12 @@ Do not set both for the same command.
 
 The GitHub Actions `Publish npm package` workflow publishes `@cheqi/cli` to npm. Run it manually with:
 
-- `version`: the package version to publish, for example `0.2.0`
+- `version`: the package version to publish, for example `0.3.1`
 - `dist-tag`: `latest` or `next`
 
 Before the CLI can be published, `@cheqi/sdk` must already exist on npm at a compatible version. Configure the repository secret `NPM_TOKEN` with publish access for the `@cheqi/cli` package.
 
 ```bash
-npm view @cheqi/sdk@0.1.1 version
-npm view @cheqi/cli@0.2.0 version
+npm view @cheqi/sdk@2.2.1 version
+npm view @cheqi/cli@0.3.1 version
 ```
