@@ -2,6 +2,8 @@
 
 Agent-friendly CLI wrapper around `@cheqi/sdk`.
 
+The CLI uses the SDK 2.2 definitive receipt flow: it resolves a delivery route from the supplied identification details, encrypts the exact merchant-supplied receipt payload for that route, and issues it without a server-side receipt-template step.
+
 Every command returns a JSON envelope on stdout:
 
 ```json
@@ -65,6 +67,8 @@ CHEQI_API_KEY=sk_test_... cheqi session match \
   --card-par YOUR_CARD_PAR
 ```
 
+`session match` reports `routeFound`, `deliveryRouteType`, `matchId`, and `recipientCount`. Finalization resolves the route again before issuing the receipt so it never relies on a stale match.
+
 ## Direct JSON Workflow
 
 ```bash
@@ -75,6 +79,20 @@ CHEQI_API_KEY=sk_test_... npx @cheqi/cli receipts submit \
 ```
 
 Use `--receipt -` to read the receipt JSON from stdin.
+
+The JSON file must be a definitive SDK 2.2 `ReceiptPayload`. In particular, provide `issueDate`, all receipt totals, `taxesApplied`, and complete product values including `identifier`, `unitCode`, `subtotal`, and `total`. The CLI validates and normalizes the payload but does not infer missing merchant values.
+
+For an anonymous matched flow that should resolve to a download fallback, use `--match-by payment_type --match-value CASH` (or `CARD_PAYMENT` / `DIRECT_DEBIT`).
+
+To create an encrypted download receipt directly, without customer matching:
+
+```bash
+CHEQI_API_KEY=sk_test_... npx @cheqi/cli receipts submit-download \
+  --receipt receipt.json \
+  --payment-type CASH
+```
+
+The successful result includes `deliveryRouteType: "DOWNLOAD_FALLBACK"` and a `downloadUrl`. The URL fragment contains the decryption key; render or hand it to the customer and do not log it server-side.
 
 ## Machine-Readable Schema
 
