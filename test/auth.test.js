@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -109,6 +110,40 @@ test("browser callback exchanges a PKCE code bound to the exact loopback redirec
   } finally {
     console.error = originalError;
     delete process.env.CHEQI_CREDENTIALS_DIR;
+    server.close();
+  }
+});
+
+test("revoked saved login gives an AUTH_REQUIRED envelope", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "cheqi-cli-revoked-"));
+  const server = createServer((request, response) => {
+    assert.equal(request.url, "/oauth2/cli/refresh");
+    response.writeHead(401).end();
+  });
+  try {
+    await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+    const endpoint = `http://127.0.0.1:${server.address().port}/`;
+    const path = join(dir, `${createHash("sha256").update(endpoint).digest("hex")}.json`);
+    await writeFile(path, JSON.stringify({
+      version: 1, endpoint, companyId: "company-1", scope: "receipt:issue",
+      accessToken: "old-access", refreshToken: "revoked-refresh",
+      accessExpiresAt: Date.now() - 1000, refreshExpiresAt: Date.now() + 3600000
+    }), { mode: 0o600 });
+    const result = await new Promise(resolve => {
+      const child = spawn(process.execPath, ["dist/index.js", "receipts", "submit-download",
+        "--receipt", "missing.json", "--endpoint", endpoint], {
+        cwd: new URL("..", import.meta.url),
+        env: { ...process.env, CHEQI_CREDENTIALS_DIR: dir }
+      });
+      let stdout = "";
+      child.stdout.on("data", chunk => { stdout += chunk; });
+      child.on("close", code => resolve({ code, stdout }));
+    });
+    assert.equal(result.code, 1);
+    const envelope = JSON.parse(result.stdout);
+    assert.equal(envelope.error.code, "AUTH_REQUIRED");
+    assert.match(envelope.error.message, /cheqi auth login/);
+  } finally {
     server.close();
   }
 });

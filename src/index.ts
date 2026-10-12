@@ -89,6 +89,7 @@ interface NextStep {
 interface SubmitOptions {
   apiKey: string | null;
   accessToken: string | null;
+  savedCredential?: boolean;
   env: string;
   endpoint: string | null;
   downloadBaseUrl: string | null;
@@ -102,6 +103,7 @@ interface SubmitOptions {
 interface AuthOptions {
   apiKey: string | null;
   accessToken: string | null;
+  savedCredential?: boolean;
   env: string;
   endpoint: string | null;
   downloadBaseUrl: string | null;
@@ -201,10 +203,39 @@ async function authCommand(args: string[]): Promise<unknown> {
 
 async function resolveSavedAuth<T extends AuthOptions>(options: T): Promise<T> {
   if (!options.apiKey && !options.accessToken) {
-    options.accessToken = await savedAccessToken(resolveEndpoint(options));
+    options.accessToken = await loadSavedAccessToken(resolveEndpoint(options));
+    options.savedCredential = Boolean(options.accessToken);
   }
   validateAuth(options);
   return options;
+}
+
+async function loadSavedAccessToken(endpoint: string, forceRefresh = false,
+                                    failedAccessToken?: string): Promise<string | null> {
+  try {
+    return await savedAccessToken(endpoint, forceRefresh, failedAccessToken);
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("CLI login expired")) {
+      throw new AppError({ code: "AUTH_REQUIRED", message: error.message });
+    }
+    throw error;
+  }
+}
+
+async function withAuthRefresh<T>(options: AuthOptions, action: (accessToken: string | null) => Promise<T>): Promise<T> {
+  try {
+    return await action(options.accessToken);
+  } catch (error) {
+    const status = error && typeof error === "object" && "httpStatusCode" in error
+      ? error.httpStatusCode : null;
+    if (!options.savedCredential || (status !== 401 && status !== 403)) throw error;
+    options.accessToken = await loadSavedAccessToken(resolveEndpoint(options), true,
+      options.accessToken ?? undefined);
+    if (!options.accessToken) {
+      throw new AppError({ code: "AUTH_REQUIRED", message: "CLI login expired; run cheqi auth login" });
+    }
+    return action(options.accessToken);
+  }
 }
 
 async function sessionCommand(args: string[]): Promise<unknown> {
@@ -363,9 +394,8 @@ async function matchSession(args: string[]): Promise<unknown> {
   session.auth.endpoint = auth.endpoint;
 
   const sdk = buildSDK(auth);
-  session.matchResponse = await sdk.matchingService.matchCustomer(
-    identificationDetails,
-    auth.accessToken
+  session.matchResponse = await withAuthRefresh(auth, accessToken =>
+    sdk.matchingService.matchCustomer(identificationDetails, accessToken)
   ) as unknown as Record<string, unknown>;
   touch(session);
   await saveSession(session);
@@ -523,11 +553,10 @@ async function finalizeSession(args: string[]): Promise<unknown> {
 
   const sdk = buildSDK(auth);
 
-  const result = await sdk.receiptService.issueReceipt(
+  const result = await withAuthRefresh(auth, accessToken => sdk.receiptService.issueReceipt(
     session.identificationDetails as unknown as IdentificationDetails,
-    definitiveReceipt(session.receipt),
-    auth.accessToken
-  );
+    definitiveReceipt(session.receipt), accessToken
+  ));
 
   return {
     ...receiptResultData(result),
@@ -554,11 +583,9 @@ async function submitReceipt(args: string[]): Promise<unknown> {
     options.matchValue as string
   );
 
-  const result = await sdk.receiptService.issueReceipt(
-    identificationDetails,
-    receipt,
-    options.accessToken
-  );
+  const result = await withAuthRefresh(options, accessToken => sdk.receiptService.issueReceipt(
+    identificationDetails, receipt, accessToken
+  ));
 
   return receiptResultData(result);
 }
@@ -624,11 +651,10 @@ async function submitDownloadReceipt(args: string[]): Promise<unknown> {
 
   const sdk = buildSDK(options);
   const receipt = definitiveReceipt(await readReceipt(options.receiptPath));
-  const result = await sdk.receiptService.issueDownloadReceipt(
+  const result = await withAuthRefresh(options, accessToken => sdk.receiptService.issueDownloadReceipt(
     { paymentType: options.paymentType as IdentificationDetails["paymentType"] },
-    receipt,
-    options.accessToken
-  );
+    receipt, accessToken
+  ));
   return receiptResultData(result);
 }
 

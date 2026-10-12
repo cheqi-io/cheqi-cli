@@ -265,17 +265,24 @@ async function withCredentialLock<T>(endpoint: string, action: () => Promise<T>)
   throw new Error("Timed out waiting for CLI credential refresh");
 }
 
-export async function savedAccessToken(endpoint: string): Promise<string | null> {
+export async function savedAccessToken(endpoint: string, forceRefresh = false,
+                                       failedAccessToken?: string): Promise<string | null> {
   const existing = await readCredentials(endpoint);
   if (!existing) return null;
-  if (existing.accessExpiresAt > Date.now() + 60000) return existing.accessToken;
+  if (forceRefresh && failedAccessToken && existing.accessToken !== failedAccessToken) {
+    return existing.accessToken;
+  }
+  if (!forceRefresh && existing.accessExpiresAt > Date.now() + 60000) return existing.accessToken;
   if (existing.refreshExpiresAt <= Date.now()) {
     throw new Error("CLI login expired; run cheqi auth login");
   }
   return withCredentialLock(endpoint, async () => {
     const current = await readCredentials(endpoint);
     if (!current) return null;
-    if (current.accessExpiresAt > Date.now() + 60000) return current.accessToken;
+    if (forceRefresh && failedAccessToken && current.accessToken !== failedAccessToken) {
+      return current.accessToken;
+    }
+    if (!forceRefresh && current.accessExpiresAt > Date.now() + 60000) return current.accessToken;
     const token = await tokenRequest(endpoint, "/oauth2/cli/refresh", {
       client_id: CLIENT_ID, refresh_token: current.refreshToken
     });
