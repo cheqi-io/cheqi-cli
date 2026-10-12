@@ -80,7 +80,7 @@ CHEQI_API_KEY=sk_... npx @cheqi/cli receipts submit \
 
 Use `--receipt -` to read the receipt JSON from stdin.
 
-The JSON file must be a definitive SDK 2.2.1 `ReceiptPayload`. In particular, provide `issueDate`, all receipt totals, `taxesApplied`, and complete product values including `identifier`, `unitCode`, `subtotal`, and `total`. The CLI validates and normalizes the payload but does not infer missing merchant values.
+The JSON file must be a definitive SDK 2.5.0 `ReceiptPayload`. In particular, provide `issueDate`, all receipt totals, `taxesApplied`, and complete product values including `identifier`, `unitCode`, `subtotal`, and `total`. The CLI validates and normalizes the payload but does not infer missing merchant values.
 
 For an anonymous matched flow that should resolve to a download fallback, use `--match-by payment_type --match-value CASH` (or `CARD_PAYMENT` / `DIRECT_DEBIT`).
 
@@ -93,6 +93,8 @@ CHEQI_API_KEY=sk_... npx @cheqi/cli receipts submit-download \
 ```
 
 The successful result includes `deliveryRouteType: "DOWNLOAD_FALLBACK"` and a `downloadUrl`. The URL fragment contains the decryption key; render or hand it to the customer and do not log it server-side.
+
+Receipt results also include `state` and `retryable`. If `accepted` is false and `preparedDownload` is present, retain the entire `preparedDownload` object (including its URL and encrypted upload request). The SDK can retry that exact upload with `receiptService.uploadPreparedDownload(preparedDownload)`. Do not give the URL to the customer until the upload is accepted. For `DIGITAL_PENDING`, retain `matchId` and check the original match with the SDK before attempting another submission.
 
 ## Machine-Readable Schema
 
@@ -143,6 +145,6 @@ The GitHub Actions `Publish npm package` workflow publishes `@cheqi/cli` to npm.
 Before the CLI can be published, `@cheqi/sdk` must already exist on npm at a compatible version. Configure the repository secret `NPM_TOKEN` with publish access for the `@cheqi/cli` package.
 
 ```bash
-npm view @cheqi/sdk@2.2.1 version
+npm view @cheqi/sdk@2.5.0 version
 npm view @cheqi/cli@0.3.1 version
 ```
