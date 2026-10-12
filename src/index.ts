@@ -558,6 +558,10 @@ function receiptResultData(result: ReceiptResult): Record<string, unknown> {
   return {
     success: result.isSuccess(),
     accepted: result.isAccepted(),
+    state: result.state,
+    retryable: result.retryable,
+    retryAfterSeconds: result.retryAfterSeconds ?? undefined,
+    preparedDownload: result.preparedDownload ?? undefined,
     cheqiReceiptId: result.cheqiReceiptId ?? undefined,
     matchId: result.matchId ?? undefined,
     deliveryRouteType: result.deliveryRouteType,
@@ -890,6 +894,17 @@ function responseSchema(name: string): Record<string, unknown> {
       return objectSchema({
         success: { type: "boolean" },
         accepted: { type: "boolean" },
+        state: { type: "string", enum: ["DIGITAL_SUBMITTED", "DIGITAL_PENDING", "DIGITAL_EXPIRED", "DOWNLOAD_FALLBACK", "EMAIL_FALLBACK"] },
+        retryable: { type: "boolean" },
+        retryAfterSeconds: { type: "number" },
+        preparedDownload: objectSchema({
+          downloadUrl: { type: "string" },
+          uploadRequest: objectSchema({
+            downloadId: { type: "string" },
+            ciphertext: { type: "string" },
+            templateHash: { type: "string" }
+          }, ["downloadId", "ciphertext", "templateHash"])
+        }, ["downloadUrl", "uploadRequest"]),
         deliveryRouteType: { type: "string", enum: ["DIGITAL", "EMAIL_FALLBACK", "DOWNLOAD_FALLBACK"] },
         status: { type: "string" },
         matchId: { type: "string" },
@@ -902,7 +917,7 @@ function responseSchema(name: string): Record<string, unknown> {
         emailReceiptRequired: { type: "boolean" },
         sessionId: { type: "string" },
         session: { type: "string" }
-      }, ["success", "accepted", "deliveryRouteType", "downloadEnvelopeRequired", "emailReceiptRequired"]);
+      }, ["success", "accepted", "state", "retryable", "deliveryRouteType", "downloadEnvelopeRequired", "emailReceiptRequired"]);
     default:
       return objectSchema({}, []);
   }

@@ -6,6 +6,7 @@ import { join, resolve } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createServer } from "node:http";
+import { generateKeyPairSync } from "node:crypto";
 
 const execFileAsync = promisify(execFile);
 const cli = resolve("dist/index.js");
@@ -450,6 +451,115 @@ test("receipts submit matches then issues the definitive receipt", async () => {
   }
 });
 
+test("receipts submit encrypts and submits a digital receipt", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "cheqi-cli-digital-"));
+  const receiptPath = join(cwd, "receipt.json");
+  await writeFile(receiptPath, JSON.stringify(definitiveReceiptFixture("INV-DIGITAL-1")));
+  const { publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const publicKeyB64 = publicKey.export({ type: "spki", format: "der" }).toString("base64");
+  const requests = [];
+  const server = createServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", () => {
+      requests.push({ url: req.url, body: JSON.parse(body) });
+      res.writeHead(req.url === "/recipient/resolve" ? 200 : 201, { "content-type": "application/json" });
+      res.end(JSON.stringify(req.url === "/recipient/resolve"
+        ? { routeFound: true, deliveryRouteType: "DIGITAL", matchId: "match-digital", recipients: [{ id: "device-1", publicKey: publicKeyB64 }] }
+        : { cheqiReceiptId: "CHQ-DIGITAL-1", matchId: "match-digital", status: "PENDING" }));
+    });
+  });
+  await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+
+  try {
+    const result = await run(cwd, [
+      "receipts", "submit", "--receipt", receiptPath,
+      "--match-by", "email", "--match-value", "buyer@example.test",
+      "--api-key", "sk_test_x",
+      "--endpoint", `http://127.0.0.1:${server.address().port}`
+    ]);
+    assert.equal(result.accepted, true);
+    assert.equal(result.state, "DIGITAL_SUBMITTED");
+    assert.equal(result.cheqiReceiptId, "CHQ-DIGITAL-1");
+    assert.deepEqual(requests.map(({ url }) => url), ["/recipient/resolve", "/receipt/encrypted"]);
+    assert.equal(requests[1].body.matchId, "match-digital");
+    assert.equal(requests[1].body.deviceDeliveries[0].deviceRecipientId, "device-1");
+  } finally {
+    await new Promise((resolveClose) => server.close(resolveClose));
+  }
+});
+
+test("receipts submit exposes recovery data for an uncertain digital submission", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "cheqi-cli-digital-retry-"));
+  const receiptPath = join(cwd, "receipt.json");
+  await writeFile(receiptPath, JSON.stringify(definitiveReceiptFixture("INV-DIGITAL-RETRY-1")));
+  const { publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const publicKeyB64 = publicKey.export({ type: "spki", format: "der" }).toString("base64");
+  const requests = [];
+  const server = createServer((req, res) => {
+    requests.push(req.url);
+    req.resume();
+    req.on("end", () => {
+      const matching = req.url === "/recipient/resolve";
+      res.writeHead(matching ? 200 : 503, { "content-type": "application/json" });
+      res.end(JSON.stringify(matching
+        ? { routeFound: true, deliveryRouteType: "DIGITAL", matchId: "match-pending", recipients: [{ id: "device-1", publicKey: publicKeyB64 }] }
+        : { message: "temporarily unavailable" }));
+    });
+  });
+  await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+
+  try {
+    const result = await run(cwd, [
+      "receipts", "submit", "--receipt", receiptPath,
+      "--match-by", "email", "--match-value", "buyer@example.test",
+      "--api-key", "sk_test_x",
+      "--endpoint", `http://127.0.0.1:${server.address().port}`,
+      "--download-base-url", "https://receipt.example.test"
+    ]);
+    assert.equal(result.accepted, false);
+    assert.equal(result.state, "DIGITAL_PENDING");
+    assert.equal(result.retryable, true);
+    assert.equal(result.matchId, "match-pending");
+    assert.equal(result.preparedDownload.downloadUrl, result.downloadUrl);
+    assert.equal(result.preparedDownload.uploadRequest.downloadId, result.downloadId);
+    assert.deepEqual(requests, ["/recipient/resolve", "/receipt/encrypted"]);
+  } finally {
+    await new Promise((resolveClose) => server.close(resolveClose));
+  }
+});
+
+test("receipts submit reports an email fallback without submitting a receipt", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "cheqi-cli-email-"));
+  const receiptPath = join(cwd, "receipt.json");
+  await writeFile(receiptPath, JSON.stringify(definitiveReceiptFixture("INV-EMAIL-1")));
+  const requests = [];
+  const server = createServer((req, res) => {
+    requests.push(req.url);
+    req.resume();
+    req.on("end", () => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ routeFound: true, deliveryRouteType: "EMAIL_FALLBACK", matchId: "match-email", recipients: [] }));
+    });
+  });
+  await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+
+  try {
+    const result = await run(cwd, [
+      "receipts", "submit", "--receipt", receiptPath,
+      "--match-by", "email", "--match-value", "buyer@example.test",
+      "--api-key", "sk_test_x",
+      "--endpoint", `http://127.0.0.1:${server.address().port}`
+    ]);
+    assert.equal(result.accepted, false);
+    assert.equal(result.state, "EMAIL_FALLBACK");
+    assert.equal(result.emailReceiptRequired, true);
+    assert.deepEqual(requests, ["/recipient/resolve"]);
+  } finally {
+    await new Promise((resolveClose) => server.close(resolveClose));
+  }
+});
+
 test("submit-download issues a client-encrypted download link end to end", async () => {
   const { decryptDownloadEnvelope, parseDownloadUrl } = await import("@cheqi/sdk/download");
   const cwd = await mkdtemp(join(tmpdir(), "cheqi-cli-submit-download-"));
@@ -507,9 +617,11 @@ test("submit-download issues a client-encrypted download link end to end", async
     assert.equal(upload.downloadId, downloadId);
     assert.equal(typeof upload.templateHash, "string");
     const envelope = await decryptDownloadEnvelope(upload.ciphertext, contentKey);
-    const cheqi = JSON.parse(envelope.documents.CHEQI.content);
-    assert.equal(cheqi.documentNumber, "INV-DL-1");
-    assert.equal(cheqi.identificationDetails.paymentType, "CASH");
+    assert.equal(envelope.envelopeVersion, 2);
+    const receipt = JSON.parse(envelope.documents.RECEIPT_PAYLOAD.content);
+    const identification = JSON.parse(envelope.documents.IDENTIFICATION_DETAILS.content);
+    assert.equal(receipt.documentNumber, "INV-DL-1");
+    assert.equal(identification.paymentType, "CASH");
 
     // The key never left the machine: no request contains the fragment.
     assert.ok(!JSON.stringify(requests).includes(contentKey));
@@ -517,6 +629,44 @@ test("submit-download issues a client-encrypted download link end to end", async
     await new Promise((resolveClose, rejectClose) => {
       server.close((error) => error ? rejectClose(error) : resolveClose());
     });
+  }
+});
+
+test("submit-download preserves the prepared upload after a retryable failure", async () => {
+  const { decryptDownloadEnvelope, parseDownloadUrl } = await import("@cheqi/sdk/download");
+  const cwd = await mkdtemp(join(tmpdir(), "cheqi-cli-download-retry-"));
+  const receiptPath = join(cwd, "receipt.json");
+  await writeFile(receiptPath, JSON.stringify(definitiveReceiptFixture("INV-RETRY-1")));
+  const requests = [];
+  const server = createServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", () => {
+      requests.push(JSON.parse(body));
+      res.writeHead(503, { "content-type": "application/json", "retry-after": "0" });
+      res.end(JSON.stringify({ message: "temporarily unavailable" }));
+    });
+  });
+  await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+
+  try {
+    const result = await run(cwd, [
+      "receipts", "submit-download", "--receipt", receiptPath,
+      "--api-key", "sk_test_x",
+      "--endpoint", `http://127.0.0.1:${server.address().port}`,
+      "--download-base-url", "https://receipt.example.test"
+    ]);
+    assert.equal(result.accepted, false);
+    assert.equal(result.state, "DOWNLOAD_FALLBACK");
+    assert.equal(result.retryable, true);
+    assert.equal(result.preparedDownload.downloadUrl, result.downloadUrl);
+    assert.deepEqual(requests, Array(requests.length).fill(result.preparedDownload.uploadRequest));
+    const { downloadId, contentKey } = parseDownloadUrl(result.downloadUrl);
+    assert.equal(result.preparedDownload.uploadRequest.downloadId, downloadId);
+    const envelope = await decryptDownloadEnvelope(result.preparedDownload.uploadRequest.ciphertext, contentKey);
+    assert.equal(JSON.parse(envelope.documents.RECEIPT_PAYLOAD.content).documentNumber, "INV-RETRY-1");
+  } finally {
+    await new Promise((resolveClose) => server.close(resolveClose));
   }
 });
 
