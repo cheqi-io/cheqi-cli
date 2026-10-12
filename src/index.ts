@@ -1,10 +1,15 @@
 #!/usr/bin/env node
 
 import { readFileSync } from "node:fs";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile, open, stat, chmod } from "node:fs/promises";
+import { resolve } from "node:path";
 import { stdin } from "node:process";
 import {
   CheqiSDK,
+  CheqiApiError,
+  CheqiSDKError,
+  EncryptionError,
+  SubmissionInProgressError,
   createReceiptPayload,
   Environment,
   NoopLogger,
@@ -14,12 +19,17 @@ import {
   type ReceiptPayload,
   type ReceiptPayloadInput
 } from "@cheqi/sdk";
+import { commands, ERROR_DEFINITIONS } from "./schema.js";
 import { parseDownloadUrl } from "@cheqi/sdk/download";
+import type { PreparedReceiptDownload } from "@cheqi/sdk";
 
 const VERSION = JSON.parse(
   readFileSync(new URL("../package.json", import.meta.url), "utf8")
 ).version as string;
 const SESSIONS_DIR = ".cheqi/sessions";
+let lastRetryAfterSeconds: number | undefined;
+let activeCommandPath: string[] = [];
+let sessionsDir = resolve(process.env.CHEQI_SESSIONS_DIR ?? SESSIONS_DIR);
 
 /**
  * Logger that writes every level to stderr, keeping stdout reserved exclusively
@@ -56,7 +66,20 @@ type ErrorCode =
   | "INPUT_INVALID"
   | "RECEIPT_INVALID"
   | "SESSION_INVALID"
-  | "SESSION_NOT_FOUND";
+  | "SESSION_NOT_FOUND"
+  | "NETWORK_ERROR"
+  | "RATE_LIMITED"
+  | "API_UNAVAILABLE"
+  | "API_REJECTED"
+  | "AUTH_INVALID"
+  | "ENCRYPTION_FAILED"
+  | "INTERNAL_ERROR"
+  | "RECEIPT_PENDING"
+  | "RECEIPT_EXPIRED"
+  | "SESSION_FINALIZED"
+  | "SESSION_LOCKED";
+
+
 
 interface AppErrorOptions {
   code: ErrorCode;
@@ -114,7 +137,7 @@ interface SubmitDownloadOptions extends AuthOptions {
 }
 
 interface Session {
-  version: 1;
+  version: 1 | 2;
   id: string;
   createdAt: string;
   updatedAt: string;
@@ -125,12 +148,26 @@ interface Session {
   identificationDetails: Record<string, unknown> | null;
   matchResponse: Record<string, unknown> | null;
   receipt: Record<string, unknown>;
+  issue?: {
+    state: "DRAFT" | ReceiptResult["state"];
+    matchId?: string | null;
+    cheqiReceiptId?: string | null;
+    downloadId?: string | null;
+    retryAfterSeconds?: number | null;
+    payload?: ReceiptPayload;
+    result?: Record<string, unknown>;
+    updatedAt: string;
+  };
 }
 
 async function main(args: string[]): Promise<void> {
   const startedAt = Date.now();
   try {
     const data = await route(args);
+    if (args[0] === "skill" && args.includes("--raw") && isRecord(data) && typeof data.content === "string") {
+      process.stdout.write((data as { content: string }).content);
+      return;
+    }
     printEnvelope(true, data, {
       durationMs: Date.now() - startedAt,
       version: VERSION
@@ -141,7 +178,7 @@ async function main(args: string[]): Promise<void> {
       durationMs: Date.now() - startedAt,
       version: VERSION
     }, appError);
-    process.exit(1);
+    process.exitCode = ERROR_DEFINITIONS.find((entry) => entry.code === appError.code)?.exitCode ?? 1;
   }
 }
 
@@ -160,11 +197,19 @@ async function route(args: string[]): Promise<unknown> {
       return receiptsCommand(rest);
     case "schema":
       return schemaCommand(rest);
+    case "skill":
+      return skillCommand(rest);
     case "version":
+      activeCommandPath = ["version"];
+      if (isHelp(rest)) return commandSchema(activeCommandPath);
+      parseArgs(activeCommandPath, rest);
       return { version: VERSION };
     case "help":
     case "-h":
     case "--help":
+      activeCommandPath = ["help"];
+      if (isHelp(rest)) return commandSchema();
+      if (rest.length) parseArgs(activeCommandPath, rest);
       return commandSchema();
     default:
       throw new AppError({
@@ -177,19 +222,20 @@ async function route(args: string[]): Promise<unknown> {
 
 async function sessionCommand(args: string[]): Promise<unknown> {
   const [command, ...rest] = args;
+  activeCommandPath = ["session", command ?? ""];
   switch (command) {
     case "create":
       if (isHelp(rest)) return commandSchema(["session", "create"]);
-      return createSession(rest);
+      return withSessionLock(rest, createSession);
     case "match":
       if (isHelp(rest)) return commandSchema(["session", "match"]);
-      return matchSession(rest);
+      return withSessionLock(rest, matchSession);
     case "status":
       if (isHelp(rest)) return commandSchema(["session", "status"]);
       return statusSession(rest);
     case "reset":
       if (isHelp(rest)) return commandSchema(["session", "reset"]);
-      return resetSession(rest);
+      return withSessionLock(rest, resetSession);
     case "help":
     case "-h":
     case "--help":
@@ -206,13 +252,20 @@ async function sessionCommand(args: string[]): Promise<unknown> {
 
 async function receiptCommand(args: string[]): Promise<unknown> {
   const [command, ...rest] = args;
+  activeCommandPath = ["receipt", command ?? ""];
   switch (command) {
     case "set":
       if (isHelp(rest)) return commandSchema(["receipt", "set"]);
-      return setReceipt(rest);
+      return withSessionLock(rest, setReceipt);
     case "add-product":
       if (isHelp(rest)) return commandSchema(["receipt", "add-product"]);
-      return addProduct(rest);
+      return withSessionLock(rest, addProduct);
+    case "remove-product":
+      if (isHelp(rest)) return commandSchema(["receipt", "remove-product"]);
+      return withSessionLock(rest, removeProduct);
+    case "list-products":
+      if (isHelp(rest)) return commandSchema(["receipt", "list-products"]);
+      return listProducts(rest);
     case "preview":
       if (isHelp(rest)) return commandSchema(["receipt", "preview"]);
       return previewSession(rest);
@@ -221,7 +274,7 @@ async function receiptCommand(args: string[]): Promise<unknown> {
       return validateSession(rest);
     case "finalize":
       if (isHelp(rest)) return commandSchema(["receipt", "finalize"]);
-      return finalizeSession(rest);
+      return withSessionLock(rest, finalizeSession);
     case "help":
     case "-h":
     case "--help":
@@ -238,6 +291,7 @@ async function receiptCommand(args: string[]): Promise<unknown> {
 
 async function receiptsCommand(args: string[]): Promise<unknown> {
   const [command, ...rest] = args;
+  activeCommandPath = ["receipts", command ?? ""];
   switch (command) {
     case "submit":
       if (isHelp(rest)) return commandSchema(["receipts", "submit"]);
@@ -245,6 +299,12 @@ async function receiptsCommand(args: string[]): Promise<unknown> {
     case "submit-download":
       if (isHelp(rest)) return commandSchema(["receipts", "submit-download"]);
       return submitDownloadReceipt(rest);
+    case "resume":
+      if (isHelp(rest)) return commandSchema(["receipts", "resume"]);
+      return resumeDirectReceipt(rest);
+    case "validate":
+      if (isHelp(rest)) return commandSchema(["receipts", "validate"]);
+      return validateDirectReceipt(rest);
     case "help":
     case "-h":
     case "--help":
@@ -260,15 +320,50 @@ async function receiptsCommand(args: string[]): Promise<unknown> {
 }
 
 async function schemaCommand(args: string[]): Promise<unknown> {
-  return commandSchema(args);
+  const path = args.filter((arg) => arg !== "--help" && arg !== "-h");
+  if (path.some((part) => part.startsWith("-"))) throw new AppError({ code: "FLAG_INVALID", message: "Unknown schema flag",
+    details: { flag: path.find((part) => part.startsWith("-")) } });
+  return commandSchema(path);
+}
+
+async function skillCommand(args: string[]): Promise<unknown> {
+  const [command, ...rest] = args;
+  if (command === "install") {
+    activeCommandPath = ["skill", "install"];
+    if (isHelp(rest)) return commandSchema(activeCommandPath);
+    const flags = parseArgs(activeCommandPath, rest);
+    const target = resolve(stringFlag(flags, "dir") ?? ".claude/skills", "cheqi/SKILL.md");
+    const content = await readFile(new URL("./cheqi/SKILL.md", import.meta.url), "utf8");
+    let existing: string | null = null;
+    try { existing = await readFile(target, "utf8"); }
+    catch (error) { if (!isNodeError(error) || error.code !== "ENOENT") throw error; }
+    const installedVersion = existing?.match(/^cli-version:\s*(\S+)/m)?.[1];
+    if (installedVersion && compareVersions(installedVersion, VERSION) > 0 && !booleanFlag(flags, "force")) {
+      throw new AppError({ code: "INPUT_INVALID", message: "Installed Cheqi skill is newer; use --force to replace it",
+        details: { path: target, installedVersion, version: VERSION } });
+    }
+    await mkdir(resolve(target, ".."), { recursive: true });
+    await writeFile(target, content, "utf8");
+    return { path: target, version: VERSION };
+  }
+  activeCommandPath = ["skill"];
+  if (isHelp(args)) return commandSchema(activeCommandPath);
+  parseArgs(activeCommandPath, args);
+  return { content: await readFile(new URL("./cheqi/SKILL.md", import.meta.url), "utf8"), version: VERSION };
+}
+
+function compareVersions(a: string, b: string): number {
+  const left = a.split(".").map(Number); const right = b.split(".").map(Number);
+  for (let i = 0; i < 3; i++) { if ((left[i] ?? 0) !== (right[i] ?? 0)) return (left[i] ?? 0) - (right[i] ?? 0); }
+  return 0;
 }
 
 async function createSession(args: string[]): Promise<unknown> {
-  const flags = parseFlags(args);
+  const flags = parseArgs(activeCommandPath, args);
   const now = new Date().toISOString();
   const sessionId = requireSessionId(flags);
   const session: Session = {
-    version: 1,
+    version: 2,
     id: sessionId,
     createdAt: now,
     updatedAt: now,
@@ -278,9 +373,10 @@ async function createSession(args: string[]): Promise<unknown> {
     },
     identificationDetails: null,
     matchResponse: null,
+    issue: { state: "DRAFT", updatedAt: now },
     receipt: {
-      documentNumber: stringFlag(flags, "document-number") ?? stringFlag(flags, "documentNumber") ?? `RECEIPT-${Date.now()}`,
-      issueDate: parseIssueDate(stringFlag(flags, "issue-date") ?? stringFlag(flags, "issueDate") ?? "now"),
+      documentNumber: stringFlag(flags, "document-number") ?? `RECEIPT-${Date.now()}`,
+      issueDate: parseIssueDate(stringFlag(flags, "issue-date") ?? "now"),
       currency: stringFlag(flags, "currency") ?? "EUR",
       receiptSubtotal: 0,
       totalBeforeTax: 0,
@@ -310,7 +406,7 @@ async function createSession(args: string[]): Promise<unknown> {
 }
 
 async function matchSession(args: string[]): Promise<unknown> {
-  const flags = parseFlags(args);
+  const flags = parseArgs(activeCommandPath, args);
   const auth = parseAuthOptions(args);
   validateAuth(auth);
 
@@ -349,18 +445,20 @@ async function matchSession(args: string[]): Promise<unknown> {
 }
 
 async function setReceipt(args: string[]): Promise<unknown> {
-  const flags = parseFlags(args);
+  const flags = parseArgs(activeCommandPath, args);
   const session = await loadSession(requireSessionId(flags));
+  assertDraft(session);
   const receipt = session.receipt;
 
-  setIfPresent(receipt, "documentNumber", stringFlag(flags, "document-number") ?? stringFlag(flags, "documentNumber"));
+  setIfPresent(receipt, "documentNumber", stringFlag(flags, "document-number"));
   setIfPresent(receipt, "currency", stringFlag(flags, "currency"));
-  const issueDate = stringFlag(flags, "issue-date") ?? stringFlag(flags, "issueDate");
+  const issueDate = stringFlag(flags, "issue-date");
   if (issueDate) {
     receipt.issueDate = parseIssueDate(issueDate);
   }
   setIfPresent(receipt, "note", stringFlag(flags, "note"));
 
+  if (session.issue) session.issue.payload = undefined;
   touch(session);
   await saveSession(session);
   return {
@@ -372,7 +470,7 @@ async function setReceipt(args: string[]): Promise<unknown> {
 }
 
 async function addProduct(args: string[]): Promise<unknown> {
-  const flags = parseFlags(args);
+  const flags = parseArgs(activeCommandPath, args);
   const positionalName = flags._[0];
   const name = stringFlag(flags, "name") ?? positionalName;
   if (!name) {
@@ -383,15 +481,15 @@ async function addProduct(args: string[]): Promise<unknown> {
     });
   }
 
-  const quantity = numberFlag(flags, "quantity") ?? numberFlag(flags, "qty") ?? 1;
-  const vatRate = numberFlag(flags, "vat") ?? numberFlag(flags, "tax-rate") ?? numberFlag(flags, "taxRate") ?? 0;
-  const taxType = stringFlag(flags, "tax-type") ?? stringFlag(flags, "taxType") ?? "VAT";
-  const unitCode = stringFlag(flags, "unit-code") ?? stringFlag(flags, "unitCode") ?? "C62";
-  const brandName = stringFlag(flags, "brand") ?? stringFlag(flags, "brand-name") ?? "";
-  const identifier = stringFlag(flags, "identifier") ?? stringFlag(flags, "sku");
+  const quantity = numberFlag(flags, "quantity") ?? 1;
+  const vatRate = numberFlag(flags, "vat") ?? 0;
+  const taxType = stringFlag(flags, "tax-type") ?? "VAT";
+  const unitCode = stringFlag(flags, "unit-code") ?? "C62";
+  const brandName = stringFlag(flags, "brand") ?? "";
+  const identifier = stringFlag(flags, "identifier");
 
-  const priceIncl = numberFlag(flags, "price-incl") ?? numberFlag(flags, "priceIncl") ?? numberFlag(flags, "gross");
-  const unitPrice = numberFlag(flags, "unit-price") ?? numberFlag(flags, "unitPrice") ?? numberFlag(flags, "price-excl") ?? numberFlag(flags, "priceExcl");
+  const priceIncl = numberFlag(flags, "price-incl");
+  const unitPrice = numberFlag(flags, "unit-price");
 
   if (priceIncl === undefined && unitPrice === undefined) {
     throw new AppError({
@@ -410,10 +508,11 @@ async function addProduct(args: string[]): Promise<unknown> {
     type: taxType,
     taxableAmount: subtotal,
     amount: taxAmount,
-    label: stringFlag(flags, "tax-label") ?? stringFlag(flags, "taxLabel") ?? taxType
+    label: stringFlag(flags, "tax-label") ?? taxType
   };
 
   const session = await loadSession(requireSessionId(flags));
+  assertDraft(session);
   const products = Array.isArray(session.receipt.products) ? session.receipt.products : [];
   const product = {
     name,
@@ -431,6 +530,7 @@ async function addProduct(args: string[]): Promise<unknown> {
   session.receipt.products = products;
   recomputeTotals(session.receipt);
 
+  if (session.issue) session.issue.payload = undefined;
   touch(session);
   await saveSession(session);
   return {
@@ -442,17 +542,44 @@ async function addProduct(args: string[]): Promise<unknown> {
   };
 }
 
+async function removeProduct(args: string[]): Promise<unknown> {
+  const flags = parseArgs(activeCommandPath, args);
+  const session = await loadSession(requireSessionId(flags));
+  assertDraft(session);
+  const line = stringFlag(flags, "line") as string;
+  const products = Array.isArray(session.receipt.products) ? session.receipt.products : [];
+  const numericIndex = /^[1-9][0-9]*$/.test(line) ? Number(line) - 1 : -1;
+  const index = numericIndex >= 0 ? numericIndex : products.findIndex((product) => isRecord(product) && product.identifier === line);
+  if (index < 0 || index >= products.length) throw new AppError({ code: "INPUT_INVALID", message: "Product line not found", details: { line } });
+  const [removed] = products.splice(index, 1);
+  session.receipt.products = products;
+  recomputeTotals(session.receipt);
+  if (session.issue) session.issue.payload = undefined;
+  touch(session);
+  await saveSession(session);
+  return { sessionId: session.id, session: sessionPath(session.id), removed, totals: totals(session.receipt),
+    nextStep: nextStep(["receipt", "list-products"], ["session"]) };
+}
+
+async function listProducts(args: string[]): Promise<unknown> {
+  const flags = parseArgs(activeCommandPath, args);
+  const session = await loadSession(requireSessionId(flags));
+  return { sessionId: session.id, session: sessionPath(session.id), products: session.receipt.products ?? [],
+    totals: totals(session.receipt), nextStep: statusNextStep(session) };
+}
+
 async function previewSession(args: string[]): Promise<unknown> {
-  const session = await loadSession(requireSessionId(parseFlags(args)));
+  const session = await loadSession(requireSessionId(parseArgs(activeCommandPath, args)));
   recomputeTotals(session.receipt);
   return {
-    session,
+    session: sessionPath(session.id),
+    draft: session,
     nextStep: nextStep(["receipt", "validate"], ["session"], [], "Validate locally before finalizing.")
   };
 }
 
 async function statusSession(args: string[]): Promise<unknown> {
-  const session = await loadSession(requireSessionId(parseFlags(args)));
+  const session = await loadSession(requireSessionId(parseArgs(activeCommandPath, args)));
   return {
     sessionId: session.id,
     session: sessionPath(session.id),
@@ -461,17 +588,19 @@ async function statusSession(args: string[]): Promise<unknown> {
     productCount: Array.isArray(session.receipt.products) ? session.receipt.products.length : 0,
     totals: totals(session.receipt),
     updatedAt: session.updatedAt,
+    issueState: issueState(session),
     nextStep: statusNextStep(session)
   };
 }
 
 async function validateSession(args: string[]): Promise<unknown> {
-  const session = await loadSession(requireSessionId(parseFlags(args)));
+  const session = await loadSession(requireSessionId(parseArgs(activeCommandPath, args)));
   recomputeTotals(session.receipt);
   validateReadyToFinalize(session);
   return {
     valid: true,
     sessionId: session.id,
+    session: sessionPath(session.id),
     totals: totals(session.receipt),
     nextStep: nextStep(["receipt", "finalize"], ["session"], ["api-key", "access-token", "env", "endpoint", "timeout"], "Finalize only after local validation succeeds.")
   };
@@ -479,11 +608,26 @@ async function validateSession(args: string[]): Promise<unknown> {
 
 async function finalizeSession(args: string[]): Promise<unknown> {
   const auth = parseAuthOptions(args);
-  validateAuth(auth);
-  const flags = parseFlags(args);
+  const flags = parseArgs(activeCommandPath, args);
   const session = await loadSession(requireSessionId(flags));
-  recomputeTotals(session.receipt);
-  validateReadyToFinalize(session);
+  const state = issueState(session);
+  if (["DIGITAL_SUBMITTED", "DOWNLOAD_FALLBACK", "EMAIL_FALLBACK"].includes(state)
+      && !(state === "DOWNLOAD_FALLBACK" && session.issue?.result?.retryable === true)) {
+    const sidecar = state === "DOWNLOAD_FALLBACK" ? await loadDownloadSidecar(session.id) : null;
+    return { ...session.issue?.result, ...(sidecar ? { downloadUrl: sidecar.downloadUrl } : {}),
+      alreadyFinalized: true, sessionId: session.id, session: sessionPath(session.id) };
+  }
+  validateAuth(auth);
+  if (state === "DIGITAL_EXPIRED" && stringFlag(flags, "fallback") !== "download") {
+    throw expiredReceipt(session.id);
+  }
+  if (state === "DRAFT") {
+    recomputeTotals(session.receipt);
+    validateReadyToFinalize(session);
+    session.issue = { state: "DRAFT", payload: session.issue?.payload ?? definitiveReceipt(session.receipt), updatedAt: new Date().toISOString() };
+    session.version = 2;
+    await saveSession(session);
+  }
 
   const sdk = buildSDK({
     ...auth,
@@ -491,22 +635,48 @@ async function finalizeSession(args: string[]): Promise<unknown> {
     endpoint: stringFlag(flags, "endpoint") ?? session.auth.endpoint ?? auth.endpoint
   });
 
-  const result = await sdk.receiptService.issueReceipt(
-    session.identificationDetails as unknown as IdentificationDetails,
-    definitiveReceipt(session.receipt),
-    auth.accessToken
-  );
+  if (stringFlag(flags, "fallback") === "download" || (state === "DOWNLOAD_FALLBACK" && session.issue?.result?.retryable === true)) {
+    const prepared = await loadPreparedDownload(session.id);
+    if (!prepared) throw expiredReceipt(session.id);
+    const uploaded = await sdk.receiptService.uploadPreparedDownload(prepared, auth.accessToken);
+    const data = { success: true, accepted: true, state: "DOWNLOAD_FALLBACK", retryable: false,
+      matchId: session.issue?.matchId, cheqiReceiptId: uploaded.cheqiReceiptId,
+      downloadUrl: prepared.downloadUrl, downloadId: prepared.uploadRequest.downloadId,
+      deliveryRouteType: "DOWNLOAD_FALLBACK" };
+    session.issue = { ...session.issue!, state: "DOWNLOAD_FALLBACK", cheqiReceiptId: uploaded.cheqiReceiptId,
+      result: withoutSecret(data), updatedAt: new Date().toISOString() };
+    await saveSession(session);
+    return { ...data, sessionId: session.id, session: sessionPath(session.id) };
+  }
+  const payload = session.issue?.payload;
+  if (!payload) throw new AppError({ code: "SESSION_INVALID", message: "Session has no saved receipt payload" });
+  const result = state === "DIGITAL_PENDING"
+    ? await sdk.receiptService.resumeReceipt(session.issue?.matchId as string, payload, { accessToken: auth.accessToken })
+    : await sdk.receiptService.issueReceipt(session.identificationDetails as unknown as IdentificationDetails, payload, { accessToken: auth.accessToken });
+  if (result.preparedDownload) await saveDownloadSidecar(session.id, result.preparedDownload);
+  else if (result.downloadUrl) await saveDownloadSidecar(session.id, { downloadUrl: result.downloadUrl });
+  const data = receiptResultData(result);
+  session.issue = { ...session.issue!, state: result.state, matchId: result.matchId,
+    cheqiReceiptId: result.cheqiReceiptId, downloadId: typeof data.downloadId === "string" ? data.downloadId : undefined,
+    retryAfterSeconds: result.retryAfterSeconds, result: withoutSecret(data), updatedAt: new Date().toISOString() };
+  await saveSession(session);
+  if (result.state === "DIGITAL_SUBMITTED") await rm(downloadSidecarPath(session.id), { force: true });
+  if (result.state === "DIGITAL_PENDING") throw pendingReceipt(result, ["receipt", "finalize"], session.id);
+  if (result.state === "DIGITAL_EXPIRED") throw expiredReceipt(session.id);
+  if (result.retryable && !result.isSuccess()) throw new AppError({ code: "NETWORK_ERROR", message: "Receipt upload is uncertain; retry finalize",
+    retryable: true, details: { sessionId: session.id, state: result.state } });
 
   return {
-    ...receiptResultData(result),
+    ...data,
     sessionId: session.id,
     session: sessionPath(session.id)
   };
 }
 
 async function resetSession(args: string[]): Promise<unknown> {
-  const sessionId = requireSessionId(parseFlags(args));
+  const sessionId = requireSessionId(parseArgs(activeCommandPath, args));
   await rm(sessionPath(sessionId), { force: true });
+  await rm(downloadSidecarPath(sessionId), { force: true });
   return { sessionId, session: sessionPath(sessionId), reset: true };
 }
 
@@ -524,10 +694,110 @@ async function submitReceipt(args: string[]): Promise<unknown> {
   const result = await sdk.receiptService.issueReceipt(
     identificationDetails,
     receipt,
-    options.accessToken
+    { accessToken: options.accessToken }
   );
-
+  if (result.state === "DIGITAL_PENDING") throw pendingReceipt(result, ["receipts", "resume"]);
+  if (result.state === "DIGITAL_EXPIRED") throw expiredReceipt();
+  if (result.retryable && !result.isSuccess()) throw new AppError({ code: "NETWORK_ERROR", message: "Receipt upload is uncertain",
+    retryable: true, details: { state: result.state } });
   return receiptResultData(result);
+}
+
+async function validateDirectReceipt(args: string[]): Promise<unknown> {
+  const flags = parseArgs(activeCommandPath, args);
+  const receipt = definitiveReceipt(await readReceipt(stringFlag(flags, "receipt") as string));
+  return { valid: true, totals: totals(receipt as unknown as Record<string, unknown>) };
+}
+
+async function resumeDirectReceipt(args: string[]): Promise<unknown> {
+  const flags = parseArgs(activeCommandPath, args);
+  const matchId = stringFlag(flags, "match-id");
+  const path = stringFlag(flags, "receipt");
+  if (!matchId) throw requiredFlag("match-id");
+  if (!path) throw requiredFlag("receipt");
+  const auth = parseAuthOptions(args);
+  validateAuth(auth);
+  const sdk = buildSDK(auth);
+  const payload = definitiveReceipt(await readReceipt(path));
+  const result = await sdk.receiptService.resumeReceipt(matchId, payload, { accessToken: auth.accessToken });
+  if (result.state === "DIGITAL_PENDING") throw pendingReceipt(result, ["receipts", "resume"]);
+  if (result.state === "DIGITAL_EXPIRED") throw expiredReceipt();
+  return receiptResultData(result);
+}
+
+function issueState(session: Session): "DRAFT" | ReceiptResult["state"] {
+  return session.issue?.state ?? "DRAFT";
+}
+
+function assertDraft(session: Session): void {
+  if (issueState(session) !== "DRAFT") {
+    throw new AppError({ code: "SESSION_FINALIZED", message: "The receipt payload is frozen after finalization starts",
+      details: { state: issueState(session) } });
+  }
+}
+
+function pendingReceipt(result: ReceiptResult, command: string[], sessionId?: string): AppError {
+  return new AppError({ code: "RECEIPT_PENDING", message: "Receipt submission is pending; resume the original match",
+    retryable: true, details: { state: result.state, matchId: result.matchId,
+      ...(result.retryAfterSeconds !== null ? { retryAfterSeconds: result.retryAfterSeconds } : {}),
+      nextStep: nextStep(command, sessionId ? ["session"] : ["match-id", "receipt"], [], "Retry after retryAfterSeconds when provided."),
+      ...(sessionId ? { sessionId } : {}) } });
+}
+
+function expiredReceipt(sessionId?: string): AppError {
+  return new AppError({ code: "RECEIPT_EXPIRED", message: "The original digital match expired",
+    details: { ...(sessionId ? { sessionId } : {}), nextStep: nextStep(["receipt", "finalize"], ["session", "fallback"], [], "Use --fallback download for the prepared download.") } });
+}
+
+function withoutSecret(data: Record<string, unknown>): Record<string, unknown> {
+  const { downloadUrl: _url, preparedDownload: _prepared, ...safe } = data;
+  return safe;
+}
+
+function downloadSidecarPath(sessionId: string): string {
+  return resolve(sessionsDir, `${sessionId}.download.json`);
+}
+
+async function saveDownloadSidecar(sessionId: string, prepared: { downloadUrl: string; uploadRequest?: PreparedReceiptDownload["uploadRequest"] }): Promise<void> {
+  await mkdir(sessionsDir, { recursive: true });
+  const target = downloadSidecarPath(sessionId);
+  const temporary = `${target}.${process.pid}.tmp`;
+  await writeFile(temporary, JSON.stringify(prepared), { mode: 0o600 });
+  await chmod(temporary, 0o600);
+  await rename(temporary, target);
+}
+
+async function loadDownloadSidecar(sessionId: string): Promise<{ downloadUrl: string; uploadRequest?: PreparedReceiptDownload["uploadRequest"] } | null> {
+  try { return JSON.parse(await readFile(downloadSidecarPath(sessionId), "utf8")) as PreparedReceiptDownload; }
+  catch (error) { if (isNodeError(error) && error.code === "ENOENT") return null; throw error; }
+}
+
+async function loadPreparedDownload(sessionId: string): Promise<PreparedReceiptDownload | null> {
+  const sidecar = await loadDownloadSidecar(sessionId);
+  return sidecar?.uploadRequest ? sidecar as PreparedReceiptDownload : null;
+}
+
+async function withSessionLock(args: string[], handler: (args: string[]) => Promise<unknown>): Promise<unknown> {
+  const flags = parseArgs(activeCommandPath, args);
+  const id = requireSessionId(flags);
+  await mkdir(sessionsDir, { recursive: true });
+  const lockPath = `${sessionPath(id)}.lock`;
+  const deadline = Date.now() + 5000;
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  while (!handle) {
+    try { handle = await open(lockPath, "wx", 0o600); }
+    catch (error) {
+      if (!isNodeError(error) || error.code !== "EEXIST") throw error;
+      try {
+        if (Date.now() - (await stat(lockPath)).mtimeMs > 60_000) { await rm(lockPath, { force: true }); continue; }
+      } catch (statError) { if (!isNodeError(statError) || statError.code !== "ENOENT") throw statError; }
+      if (Date.now() >= deadline) throw new AppError({ code: "SESSION_LOCKED", message: "Session is busy; retry shortly", retryable: true,
+        details: { sessionId: id } });
+      await new Promise((done) => setTimeout(done, 30 + Math.floor(Math.random() * 40)));
+    }
+  }
+  try { return await handler(args); }
+  finally { await handle.close(); await rm(lockPath, { force: true }); }
 }
 
 // Public receipt-download page per environment (Download Link Contract v1).
@@ -596,207 +866,18 @@ async function submitDownloadReceipt(args: string[]): Promise<unknown> {
     receipt,
     options.accessToken
   );
+  if (result.retryable && !result.isSuccess()) throw new AppError({ code: "NETWORK_ERROR", message: "Receipt upload is uncertain",
+    retryable: true, details: { state: result.state } });
   return receiptResultData(result);
 }
 
 function parseSubmitDownloadOptions(args: string[]): SubmitDownloadOptions {
-  const options: SubmitDownloadOptions = {
-    apiKey: env("CHEQI_API_KEY"),
-    accessToken: env("CHEQI_ACCESS_TOKEN"),
-    env: env("CHEQI_ENV") ?? "sandbox",
-    endpoint: env("CHEQI_API_ENDPOINT"),
-    receiptPath: null,
-    downloadBaseUrl: env("CHEQI_DOWNLOAD_BASE_URL"),
-    paymentType: "CASH",
-    timeoutSeconds: parsePositiveInt(env("CHEQI_TIMEOUT_SECONDS"), 30),
-    verbose: false
-  };
-
-  for (let index = 0; index < args.length; index++) {
-    const arg = args[index];
-    switch (arg) {
-      case "--api-key":
-        options.apiKey = readFlagValue(args, ++index, arg);
-        break;
-      case "--access-token":
-        options.accessToken = readFlagValue(args, ++index, arg);
-        break;
-      case "--env":
-        options.env = readFlagValue(args, ++index, arg);
-        break;
-      case "--endpoint":
-        options.endpoint = readFlagValue(args, ++index, arg);
-        break;
-      case "--receipt":
-        options.receiptPath = readFlagValue(args, ++index, arg);
-        break;
-      case "--download-base-url":
-        options.downloadBaseUrl = readFlagValue(args, ++index, arg);
-        break;
-      case "--payment-type": {
-        options.paymentType = parsePaymentType(readFlagValue(args, ++index, arg));
-        break;
-      }
-      case "--timeout":
-        options.timeoutSeconds = parsePositiveInt(readFlagValue(args, ++index, arg), 30);
-        break;
-      case "--verbose":
-        options.verbose = true;
-        break;
-      default:
-        throw new AppError({
-          code: "FLAG_INVALID",
-          message: `Unknown option: ${arg}`,
-          details: { flag: arg }
-        });
-    }
-  }
-
-  return options;
+  const flags = parseArgs(activeCommandPath, args);
+  return { ...authFromFlags(flags), receiptPath: stringFlag(flags, "receipt"),
+    paymentType: stringFlag(flags, "payment-type") ?? "CASH" };
 }
 
 function commandSchema(path: string[] = []): unknown {
-  const commands = [
-    {
-      command: ["session", "create"],
-      summary: "Create a local receipt session.",
-      positional: [],
-      flags: [
-        flag("session", "string", true),
-        flag("currency", "string", false, "EUR"),
-        flag("document-number", "string", false),
-        flag("issue-date", "string", false, "now"),
-        flag("env", "enum", false, "sandbox", ["sandbox", "test", "production"]),
-        flag("endpoint", "string", false),
-        flag("card-par", "string", false),
-        flag("pairing-code", "string", false),
-        flag("payment-account-identifier", "string", false),
-        flag("email", "string", false),
-        flag("payment-type", "enum", false, undefined, ["CARD_PAYMENT", "CASH", "DIRECT_DEBIT"])
-      ],
-      response: "SessionCreateResponse",
-      responseSchema: responseSchema("SessionCreateResponse")
-    },
-    {
-      command: ["session", "match"],
-      summary: "Match a customer for an existing session.",
-      positional: [],
-      flags: authFlags([
-        flag("session", "string", true),
-        flag("card-par", "string", false),
-        flag("pairing-code", "string", false),
-        flag("payment-account-identifier", "string", false),
-        flag("email", "string", false),
-        flag("payment-type", "enum", false, undefined, ["CARD_PAYMENT", "CASH", "DIRECT_DEBIT"])
-      ]),
-      response: "SessionMatchResponse",
-      responseSchema: responseSchema("SessionMatchResponse")
-    },
-    {
-      command: ["session", "status"],
-      summary: "Inspect local session state.",
-      positional: [],
-      flags: [flag("session", "string", true)],
-      response: "SessionStatusResponse",
-      responseSchema: responseSchema("SessionStatusResponse")
-    },
-    {
-      command: ["session", "reset"],
-      summary: "Delete a local session.",
-      positional: [],
-      flags: [flag("session", "string", true)],
-      response: "SessionResetResponse",
-      responseSchema: responseSchema("SessionResetResponse")
-    },
-    {
-      command: ["receipt", "set"],
-      summary: "Update receipt-level fields.",
-      positional: [],
-      flags: [
-        flag("session", "string", true),
-        flag("document-number", "string", false),
-        flag("currency", "string", false),
-        flag("issue-date", "string", false),
-        flag("note", "string", false)
-      ],
-      response: "ReceiptSetResponse",
-      responseSchema: responseSchema("ReceiptSetResponse")
-    },
-    {
-      command: ["receipt", "add-product"],
-      summary: "Append a product line to a local receipt draft.",
-      positional: [
-        {
-          name: "name",
-          type: "string",
-          required: false,
-          description: "Product name. Equivalent to --name when present."
-        }
-      ],
-      flags: [
-        flag("session", "string", true),
-        flag("name", "string", false),
-        flag("price-incl", "number", false),
-        flag("unit-price", "number", false),
-        flag("quantity", "number", false, 1),
-        flag("vat", "number", false, 0),
-        flag("tax-type", "string", false, "VAT"),
-        flag("unit-code", "string", false, "C62"),
-        flag("brand", "string", false),
-        flag("sku", "string", false)
-      ],
-      response: "ReceiptAddProductResponse",
-      responseSchema: responseSchema("ReceiptAddProductResponse")
-    },
-    {
-      command: ["receipt", "preview"],
-      summary: "Return the full local session draft.",
-      positional: [],
-      flags: [flag("session", "string", true)],
-      response: "ReceiptPreviewResponse",
-      responseSchema: responseSchema("ReceiptPreviewResponse")
-    },
-    {
-      command: ["receipt", "validate"],
-      summary: "Validate local receipt state without network side effects.",
-      positional: [],
-      flags: [flag("session", "string", true)],
-      response: "ReceiptValidateResponse",
-      responseSchema: responseSchema("ReceiptValidateResponse")
-    },
-    {
-      command: ["receipt", "finalize"],
-      summary: "Submit an existing local session receipt.",
-      positional: [],
-      flags: authFlags([flag("session", "string", true)]),
-      response: "ReceiptFinalizeResponse",
-      responseSchema: responseSchema("ReceiptFinalizeResponse")
-    },
-    {
-      command: ["receipts", "submit"],
-      summary: "Submit a receipt JSON file or stdin without creating a local session.",
-      positional: [],
-      flags: authFlags([
-        flag("receipt", "string", true),
-        flag("match-by", "enum", true, undefined, ["card_par", "pairing_code", "payment_account_identifier", "email", "payment_type"]),
-        flag("match-value", "string", true)
-      ]),
-      response: "ReceiptSubmitResponse",
-      responseSchema: responseSchema("ReceiptSubmitResponse")
-    },
-    {
-      command: ["receipts", "submit-download"],
-      summary: "Issue a receipt via a client-generated, E2E-encrypted download link (no customer matching). The QR-ready URL carries the decryption key in its #fragment.",
-      positional: [],
-      flags: authFlags([
-        flag("receipt", "string", true),
-        flag("payment-type", "enum", false, "CASH", ["CARD_PAYMENT", "CASH", "DIRECT_DEBIT"])
-      ]),
-      response: "ReceiptSubmitDownloadResponse",
-      responseSchema: responseSchema("ReceiptSubmitDownloadResponse")
-    }
-  ];
-
   const selected = path.length === 0
     ? commands
     : commands.filter((command) => path.every((part, index) => command.command[index] === part));
@@ -819,207 +900,16 @@ function commandSchema(path: string[] = []): unknown {
         meta: { durationMs: 0, version: VERSION }
       }
     },
-    commands: selected
+    commands: selected,
+    errors: ERROR_DEFINITIONS
   };
 }
 
-function flag(name: string, type: string, required: boolean, defaultValue?: unknown, values?: string[]): Record<string, unknown> {
-  return { name, type, required, default: defaultValue, values };
-}
-
-function responseSchema(name: string): Record<string, unknown> {
-  const baseProperties = {
-    sessionId: { type: "string" },
-    session: { type: "string" },
-    nextStep: nextStepSchema()
-  };
-
-  switch (name) {
-    case "SessionCreateResponse":
-      return objectSchema({
-        ...baseProperties,
-        receipt: { type: "object", additionalProperties: true },
-        hasMatch: { type: "boolean" }
-      }, ["sessionId", "session", "receipt", "hasMatch", "nextStep"]);
-    case "SessionMatchResponse":
-      return objectSchema({
-        ...baseProperties,
-        routeFound: { type: "boolean" },
-        deliveryRouteType: { type: "string", enum: ["DIGITAL", "EMAIL_FALLBACK", "DOWNLOAD_FALLBACK"] },
-        matchId: { type: "string" },
-        expiresAt: { type: "string", format: "date-time" },
-        recipientCount: { type: "number" }
-      }, ["sessionId", "session", "routeFound", "recipientCount", "nextStep"]);
-    case "SessionStatusResponse":
-      return objectSchema({
-        ...baseProperties,
-        hasMatch: { type: "boolean" },
-        hasMatchResponse: { type: "boolean" },
-        productCount: { type: "number" },
-        totals: totalsSchema(),
-        updatedAt: { type: "string", format: "date-time" }
-      }, ["sessionId", "session", "hasMatch", "hasMatchResponse", "productCount", "totals", "updatedAt", "nextStep"]);
-    case "SessionResetResponse":
-      return objectSchema({
-        sessionId: { type: "string" },
-        session: { type: "string" },
-        reset: { type: "boolean", const: true }
-      }, ["sessionId", "session", "reset"]);
-    case "ReceiptSetResponse":
-      return objectSchema({
-        ...baseProperties,
-        receipt: { type: "object", additionalProperties: true }
-      }, ["sessionId", "session", "receipt", "nextStep"]);
-    case "ReceiptAddProductResponse":
-      return objectSchema({
-        ...baseProperties,
-        added: { type: "object", additionalProperties: true },
-        totals: totalsSchema()
-      }, ["sessionId", "session", "added", "totals", "nextStep"]);
-    case "ReceiptPreviewResponse":
-      return objectSchema({
-        session: { type: "object", additionalProperties: true },
-        nextStep: nextStepSchema()
-      }, ["session", "nextStep"]);
-    case "ReceiptValidateResponse":
-      return objectSchema({
-        valid: { type: "boolean", const: true },
-        sessionId: { type: "string" },
-        totals: totalsSchema(),
-        nextStep: nextStepSchema()
-      }, ["valid", "sessionId", "totals", "nextStep"]);
-    case "ReceiptFinalizeResponse":
-    case "ReceiptSubmitResponse":
-    case "ReceiptSubmitDownloadResponse":
-      return objectSchema({
-        success: { type: "boolean" },
-        accepted: { type: "boolean" },
-        state: { type: "string", enum: ["DIGITAL_SUBMITTED", "DIGITAL_PENDING", "DIGITAL_EXPIRED", "DOWNLOAD_FALLBACK", "EMAIL_FALLBACK"] },
-        retryable: { type: "boolean" },
-        retryAfterSeconds: { type: "number" },
-        preparedDownload: objectSchema({
-          downloadUrl: { type: "string" },
-          uploadRequest: objectSchema({
-            downloadId: { type: "string" },
-            ciphertext: { type: "string" },
-            templateHash: { type: "string" }
-          }, ["downloadId", "ciphertext", "templateHash"])
-        }, ["downloadUrl", "uploadRequest"]),
-        deliveryRouteType: { type: "string", enum: ["DIGITAL", "EMAIL_FALLBACK", "DOWNLOAD_FALLBACK"] },
-        status: { type: "string" },
-        matchId: { type: "string" },
-        cheqiReceiptId: { type: "string" },
-        createdAt: { type: "string", format: "date-time" },
-        expiresAt: { type: "string", format: "date-time" },
-        downloadUrl: { type: "string", description: "Customer-facing URL with the AES key in the #fragment; render as QR, never log server-side." },
-        downloadId: { type: "string" },
-        downloadEnvelopeRequired: { type: "boolean" },
-        emailReceiptRequired: { type: "boolean" },
-        sessionId: { type: "string" },
-        session: { type: "string" }
-      }, ["success", "accepted", "state", "retryable", "deliveryRouteType", "downloadEnvelopeRequired", "emailReceiptRequired"]);
-    default:
-      return objectSchema({}, []);
-  }
-}
-
-function objectSchema(properties: Record<string, unknown>, required: string[]): Record<string, unknown> {
-  return {
-    type: "object",
-    additionalProperties: false,
-    required,
-    properties
-  };
-}
-
-function nextStepSchema(): Record<string, unknown> {
-  return objectSchema({
-    command: { type: "array", items: { type: "string" } },
-    requiredFlags: { type: "array", items: { type: "string" } },
-    optionalFlags: { type: "array", items: { type: "string" } },
-    hint: { type: "string" }
-  }, ["command"]);
-}
-
-function totalsSchema(): Record<string, unknown> {
-  return objectSchema({
-    receiptSubtotal: { type: "number" },
-    totalBeforeTax: { type: "number" },
-    totalTaxAmount: { type: "number" },
-    totalAmount: { type: "number" }
-  }, ["receiptSubtotal", "totalBeforeTax", "totalTaxAmount", "totalAmount"]);
-}
-
-function authFlags(flags: Record<string, unknown>[]): Record<string, unknown>[] {
-  return [
-    ...flags,
-    flag("api-key", "string", false),
-    flag("access-token", "string", false),
-    flag("env", "enum", false, "sandbox", ["sandbox", "test", "production"]),
-    flag("endpoint", "string", false),
-    flag("download-base-url", "string", false),
-    flag("timeout", "number", false, 30),
-    flag("verbose", "boolean", false, false)
-  ];
-}
 
 function parseSubmitOptions(args: string[]): SubmitOptions {
-  const options: SubmitOptions = {
-    apiKey: env("CHEQI_API_KEY"),
-    accessToken: env("CHEQI_ACCESS_TOKEN"),
-    env: env("CHEQI_ENV") ?? "sandbox",
-    endpoint: env("CHEQI_API_ENDPOINT"),
-    downloadBaseUrl: env("CHEQI_DOWNLOAD_BASE_URL"),
-    receiptPath: null,
-    matchBy: null,
-    matchValue: null,
-    timeoutSeconds: parsePositiveInt(env("CHEQI_TIMEOUT_SECONDS"), 30),
-    verbose: false
-  };
-
-  for (let index = 0; index < args.length; index++) {
-    const arg = args[index];
-    switch (arg) {
-      case "--api-key":
-        options.apiKey = readFlagValue(args, ++index, arg);
-        break;
-      case "--access-token":
-        options.accessToken = readFlagValue(args, ++index, arg);
-        break;
-      case "--env":
-        options.env = readFlagValue(args, ++index, arg);
-        break;
-      case "--endpoint":
-        options.endpoint = readFlagValue(args, ++index, arg);
-        break;
-      case "--download-base-url":
-        options.downloadBaseUrl = readFlagValue(args, ++index, arg);
-        break;
-      case "--receipt":
-        options.receiptPath = readFlagValue(args, ++index, arg);
-        break;
-      case "--match-by":
-        options.matchBy = readFlagValue(args, ++index, arg);
-        break;
-      case "--match-value":
-        options.matchValue = readPossiblyEmptyFlagValue(args, ++index, arg);
-        break;
-      case "--timeout":
-        options.timeoutSeconds = parsePositiveInt(readFlagValue(args, ++index, arg), 30);
-        break;
-      case "--verbose":
-        options.verbose = true;
-        break;
-      default:
-        throw new AppError({
-          code: "FLAG_INVALID",
-          message: `Unknown option: ${arg}`,
-          details: { flag: arg }
-        });
-    }
-  }
-
-  return options;
+  const flags = parseArgs(activeCommandPath, args);
+  return { ...authFromFlags(flags), receiptPath: stringFlag(flags, "receipt"),
+    matchBy: stringFlag(flags, "match-by"), matchValue: stringFlag(flags, "match-value") ?? (flags["match-value"] === "" ? "" : null) };
 }
 
 function validateSubmitOptions(options: SubmitOptions): void {
@@ -1036,10 +926,14 @@ function validateSubmitOptions(options: SubmitOptions): void {
 }
 
 function parseAuthOptions(args: string[]): AuthOptions {
-  const flags = parseFlags(args);
+  const flags = parseArgs(activeCommandPath, args);
+  return authFromFlags(flags);
+}
+
+function authFromFlags(flags: Flags): AuthOptions {
   return {
-    apiKey: stringFlag(flags, "api-key") ?? stringFlag(flags, "apiKey") ?? env("CHEQI_API_KEY"),
-    accessToken: stringFlag(flags, "access-token") ?? stringFlag(flags, "accessToken") ?? env("CHEQI_ACCESS_TOKEN"),
+    apiKey: stringFlag(flags, "api-key") ?? env("CHEQI_API_KEY"),
+    accessToken: stringFlag(flags, "access-token") ?? env("CHEQI_ACCESS_TOKEN"),
     env: stringFlag(flags, "env") ?? env("CHEQI_ENV") ?? "sandbox",
     endpoint: stringFlag(flags, "endpoint") ?? env("CHEQI_API_ENDPOINT"),
     downloadBaseUrl: stringFlag(flags, "download-base-url") ?? env("CHEQI_DOWNLOAD_BASE_URL"),
@@ -1064,12 +958,22 @@ function validateAuth(options: Pick<AuthOptions, "apiKey" | "accessToken">): voi
 }
 
 function buildSDK(options: AuthOptions): CheqiSDK {
+  lastRetryAfterSeconds = undefined;
   return new CheqiSDK({
     apiEndpoint: resolveEndpoint(options),
     apiKey: options.apiKey,
     receiptDownloadBaseUrl: options.downloadBaseUrl ?? resolveDownloadBaseUrl(options),
     timeoutSeconds: options.timeoutSeconds,
-    logger: options.verbose ? new StderrLogger() : new NoopLogger()
+    logger: options.verbose ? new StderrLogger() : new NoopLogger(),
+    fetch: async (input, init) => {
+      const response = await fetch(input, init);
+      if (response.status === 429) {
+        const retryAfter = response.headers.get("retry-after");
+        const seconds = retryAfter === null ? NaN : Number(retryAfter);
+        lastRetryAfterSeconds = Number.isFinite(seconds) && seconds >= 0 ? seconds : undefined;
+      }
+      return response;
+    }
   });
 }
 
@@ -1097,36 +1001,67 @@ function resolveEndpoint(options: Pick<AuthOptions, "endpoint" | "env">): string
 
 type Flags = Record<string, string | boolean | string[]> & { _: string[] };
 
-function parseFlags(args: string[]): Flags {
+interface FlagSchema { name: string; type: string; required: boolean; values?: string[]; aliases?: string[] }
+
+function parseArgs(commandPath: string[], args: string[]): Flags {
+  const selected = commandSchema(commandPath) as { commands: { flags: FlagSchema[]; positional: { name: string }[] }[] };
+  const schema = selected.commands[0];
+  const names = new Map<string, FlagSchema>();
+  for (const flag of schema.flags) {
+    names.set(flag.name, flag);
+    for (const alias of flag.aliases ?? []) names.set(alias, flag);
+  }
   const flags: Flags = { _: [] };
   for (let index = 0; index < args.length; index++) {
     const arg = args[index];
     if (arg.startsWith("--")) {
       const withoutPrefix = arg.slice(2);
       const equalsIndex = withoutPrefix.indexOf("=");
-      if (equalsIndex >= 0) {
-        flags[withoutPrefix.slice(0, equalsIndex)] = withoutPrefix.slice(equalsIndex + 1);
+      const name = equalsIndex >= 0 ? withoutPrefix.slice(0, equalsIndex) : withoutPrefix;
+      const spec = names.get(name);
+      if (!spec) {
+        const suggestion = [...names.keys()].map((known) => ({ known, distance: editDistance(name, known) }))
+          .sort((a, b) => a.distance - b.distance)[0];
+        throw new AppError({ code: "FLAG_INVALID", message: `Unknown flag --${name}`,
+          details: { flag: name, ...(suggestion && suggestion.distance <= 2 ? { suggestion: suggestion.known } : {}) } });
+      }
+      if (Object.hasOwn(flags, spec.name)) throw new AppError({ code: "FLAG_INVALID", message: `Repeated flag --${spec.name}`, details: { flag: spec.name } });
+      if (spec.type === "boolean") {
+        if (equalsIndex >= 0) throw new AppError({ code: "FLAG_INVALID", message: `--${spec.name} takes no value`, details: { flag: spec.name } });
+        flags[spec.name] = true;
         continue;
       }
-      const next = args[index + 1];
-      if (next && !next.startsWith("--")) {
-        flags[withoutPrefix] = next;
-        index++;
-      } else {
-        flags[withoutPrefix] = true;
+      const value = equalsIndex >= 0 ? withoutPrefix.slice(equalsIndex + 1) : args[++index];
+      if (value === undefined || value.startsWith("--")) throw requiredFlag(spec.name);
+      if (spec.type === "number" && !Number.isFinite(Number(value.replace(",", ".")))) {
+        throw new AppError({ code: "FLAG_INVALID", message: `--${spec.name} must be a number`, details: { flag: spec.name, value } });
       }
+      if (spec.type === "enum") {
+        const canonical = spec.values?.find((candidate) => candidate.toLowerCase() === value.toLowerCase());
+        if (!canonical) throw new AppError({ code: "FLAG_INVALID", message: `Invalid value for --${spec.name}`, details: { flag: spec.name, value, values: spec.values } });
+        flags[spec.name] = canonical;
+      } else flags[spec.name] = value;
       continue;
     }
-
-    const colonIndex = arg.indexOf(":");
-    if (colonIndex > 0) {
-      flags[arg.slice(0, colonIndex)] = arg.slice(colonIndex + 1);
-      continue;
-    }
-
     flags._.push(arg);
   }
+  if (flags._.length > schema.positional.length) throw new AppError({ code: "INPUT_INVALID", message: "Too many positional arguments" });
+  const missing = schema.flags.filter((flag) => flag.required && !Object.hasOwn(flags, flag.name)).map((flag) => flag.name);
+  if (missing.length) throw new AppError({ code: "FLAG_REQUIRED", message: `Missing required flags: ${missing.map((name) => `--${name}`).join(", ")}`, details: { flags: missing } });
+  const customSessionsDir = stringFlag(flags, "sessions-dir");
+  sessionsDir = resolve(customSessionsDir ?? process.env.CHEQI_SESSIONS_DIR ?? SESSIONS_DIR);
   return flags;
+}
+
+function editDistance(a: string, b: string): number {
+  const row = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    let previous = row[0]; row[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const next = row[j]; row[j] = Math.min(row[j] + 1, row[j - 1] + 1, previous + (a[i - 1] === b[j - 1] ? 0 : 1)); previous = next;
+    }
+  }
+  return row[b.length];
 }
 
 function requireSessionId(flags: Flags): string {
@@ -1138,26 +1073,25 @@ function requireSessionId(flags: Flags): string {
 }
 
 function sessionIdFromFlags(flags: Flags): string | null {
-  return sanitizeSessionId(stringFlag(flags, "session") ?? stringFlag(flags, "session-id") ?? stringFlag(flags, "sessionId"));
+  return sanitizeSessionId(typeof flags.session === "string" ? flags.session : null);
 }
 
 function sanitizeSessionId(value: string | null): string | null {
   if (value === null) {
     return null;
   }
-  const sanitized = value.trim().replace(/[^A-Za-z0-9._-]/g, "-");
-  if (!sanitized || sanitized === "." || sanitized === "..") {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(value)) {
     throw new AppError({
       code: "SESSION_INVALID",
       message: "Invalid session id",
-      details: { value }
+      details: { value, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" }
     });
   }
-  return sanitized;
+  return value;
 }
 
 function sessionPath(sessionId: string): string {
-  return `${SESSIONS_DIR}/${sessionId}.json`;
+  return resolve(sessionsDir, `${sessionId}.json`);
 }
 
 function stringFlag(flags: Flags, name: string): string | null {
@@ -1190,19 +1124,17 @@ function booleanFlag(flags: Flags, name: string): boolean {
 }
 
 function identificationDetailsFromFlags(flags: Flags): IdentificationDetails | null {
-  const cardPar = stringFlag(flags, "card-par") ?? stringFlag(flags, "cardPar");
+  const cardPar = stringFlag(flags, "card-par");
   if (cardPar !== null) {
     return buildIdentificationDetails("card_par", cardPar);
   }
 
-  const pairingCode = stringFlag(flags, "pairing-code") ?? stringFlag(flags, "pairingCode");
+  const pairingCode = stringFlag(flags, "pairing-code");
   if (pairingCode !== null) {
     return buildIdentificationDetails("pairing_code", pairingCode);
   }
 
-  const paymentAccountIdentifier = stringFlag(flags, "payment-account-identifier")
-    ?? stringFlag(flags, "paymentAccountIdentifier")
-    ?? stringFlag(flags, "iban");
+  const paymentAccountIdentifier = stringFlag(flags, "payment-account-identifier");
   if (paymentAccountIdentifier !== null) {
     return buildIdentificationDetails("payment_account_identifier", paymentAccountIdentifier);
   }
@@ -1212,18 +1144,18 @@ function identificationDetailsFromFlags(flags: Flags): IdentificationDetails | n
     return buildIdentificationDetails("email", email);
   }
 
-  const paymentType = stringFlag(flags, "payment-type") ?? stringFlag(flags, "paymentType");
+  const paymentType = stringFlag(flags, "payment-type");
   if (paymentType !== null) {
     return buildIdentificationDetails("payment_type", paymentType);
   }
 
-  if (hasAnyFlag(flags, ["card-par", "cardPar"])) return buildIdentificationDetails("card_par", "");
-  if (hasAnyFlag(flags, ["pairing-code", "pairingCode"])) return buildIdentificationDetails("pairing_code", "");
-  if (hasAnyFlag(flags, ["payment-account-identifier", "paymentAccountIdentifier", "iban"])) {
+  if (hasAnyFlag(flags, ["card-par"])) return buildIdentificationDetails("card_par", "");
+  if (hasAnyFlag(flags, ["pairing-code"])) return buildIdentificationDetails("pairing_code", "");
+  if (hasAnyFlag(flags, ["payment-account-identifier"])) {
     return buildIdentificationDetails("payment_account_identifier", "");
   }
   if (hasAnyFlag(flags, ["email"])) return buildIdentificationDetails("email", "");
-  if (hasAnyFlag(flags, ["payment-type", "paymentType"])) {
+  if (hasAnyFlag(flags, ["payment-type"])) {
     throw new AppError({
       code: "FLAG_REQUIRED",
       message: "--payment-type requires a value",
@@ -1235,7 +1167,14 @@ function identificationDetailsFromFlags(flags: Flags): IdentificationDetails | n
 }
 
 async function readReceipt(path: string): Promise<Record<string, unknown>> {
-  const raw = path === "-" ? await readStdin() : await readFile(path, "utf8");
+  let raw: string;
+  try { raw = path === "-" ? await readStdin() : await readFile(path, "utf8"); }
+  catch (error) {
+    if (isNodeError(error) && ["ENOENT", "EISDIR", "EACCES"].includes(error.code as string)) {
+      throw new AppError({ code: "INPUT_INVALID", message: "Receipt input could not be read", details: { path } });
+    }
+    throw error;
+  }
   try {
     return JSON.parse(raw) as Record<string, unknown>;
   } catch (error) {
@@ -1326,7 +1265,7 @@ async function loadSession(sessionId: string): Promise<Session> {
 }
 
 async function saveSession(session: Session): Promise<void> {
-  await mkdir(SESSIONS_DIR, { recursive: true });
+  await mkdir(sessionsDir, { recursive: true });
   const path = sessionPath(session.id);
   const tempPath = `${path}.${process.pid}.tmp`;
   await writeFile(tempPath, `${JSON.stringify(session, null, 2)}\n`, "utf8");
@@ -1411,7 +1350,7 @@ function validateReceiptDraft(receipt: Record<string, unknown>): void {
     if (typeof receipt[field] !== "string" || receipt[field] === "") {
       throw new AppError({
         code: "RECEIPT_INVALID",
-        message: `Receipt ${field} is required. Run cheqi receipt set --session <id> --${field} ...`,
+        message: `Receipt ${field} is required. Run cheqi receipt set --session <id> --${canonicalReceiptFlag(field)} ...`,
         details: { field }
       });
     }
@@ -1423,6 +1362,12 @@ function validateReceiptDraft(receipt: Record<string, unknown>): void {
       details: { field: "products" }
     });
   }
+}
+
+function canonicalReceiptFlag(field: string): string {
+  const kebab = field.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`);
+  const entry = commands.find((item) => item.command.join(" ") === "receipt set");
+  return String(entry?.flags.find((flag) => flag.name === kebab)?.name ?? kebab);
 }
 
 function setIfPresent(target: Record<string, unknown>, key: string, value: string | null): void {
@@ -1488,30 +1433,6 @@ function parsePaymentType(value: string): NonNullable<IdentificationDetails["pay
   return paymentType as NonNullable<IdentificationDetails["paymentType"]>;
 }
 
-function readFlagValue(args: string[], index: number, flagName: string): string {
-  const value = args[index];
-  if (!value || value.startsWith("--")) {
-    throw new AppError({
-      code: "FLAG_REQUIRED",
-      message: `${flagName} requires a value`,
-      details: { flag: flagName.replace(/^--/, "") }
-    });
-  }
-  return value;
-}
-
-function readPossiblyEmptyFlagValue(args: string[], index: number, flagName: string): string {
-  const value = args[index];
-  if (value === undefined || value.startsWith("--")) {
-    throw new AppError({
-      code: "FLAG_REQUIRED",
-      message: `${flagName} requires a value`,
-      details: { flag: flagName.replace(/^--/, "") }
-    });
-  }
-  return value;
-}
-
 async function readStdin(): Promise<string> {
   const chunks: Buffer[] = [];
   for await (const chunk of stdin) {
@@ -1524,7 +1445,12 @@ function nextStep(command: string[], requiredFlags: string[] = [], optionalFlags
   return { command, requiredFlags, optionalFlags, hint };
 }
 
-function statusNextStep(session: Session): NextStep {
+function statusNextStep(session: Session): NextStep | null {
+  if (issueState(session) === "DIGITAL_PENDING") return nextStep(["receipt", "finalize"], ["session"]);
+  if (issueState(session) === "DOWNLOAD_FALLBACK" && session.issue?.result?.retryable === true) {
+    return nextStep(["receipt", "finalize"], ["session"], [], "Retry the saved prepared download upload.");
+  }
+  if (issueState(session) !== "DRAFT") return null;
   const productCount = Array.isArray(session.receipt.products) ? session.receipt.products.length : 0;
   if (!hasIdentificationDetails(session)) {
     return nextStep(["session", "match"], ["session"], ["card-par", "pairing-code", "payment-account-identifier", "email", "payment-type"]);
@@ -1552,7 +1478,7 @@ function hasAnyFlag(flags: Flags, names: string[]): boolean {
 }
 
 function isHelp(args: string[]): boolean {
-  return args.length === 1 && (args[0] === "help" || args[0] === "-h" || args[0] === "--help");
+  return args.includes("-h") || args.includes("--help") || (args.length === 1 && args[0] === "help");
 }
 
 function printEnvelope(ok: true, data: unknown, meta: Record<string, unknown>): void;
@@ -1566,7 +1492,7 @@ function printEnvelope(ok: boolean, data: unknown, meta: Record<string, unknown>
   console.log(JSON.stringify({
     ok: false,
     error: {
-      code: error?.code ?? "INPUT_INVALID",
+      code: error?.code ?? "INTERNAL_ERROR",
       message: error?.message ?? "Unknown error",
       retryable: error?.retryable ?? false,
       details: error?.details ?? undefined
@@ -1579,10 +1505,69 @@ function normalizeError(error: unknown): AppError {
   if (error instanceof AppError) {
     return error;
   }
+  if (error instanceof SubmissionInProgressError) {
+    return new AppError({ code: "RECEIPT_PENDING", message: "Receipt submission is still in progress", retryable: true,
+      details: { retryAfterSeconds: error.retryAfterSeconds } });
+  }
+  if (error instanceof EncryptionError) {
+    return new AppError({ code: "ENCRYPTION_FAILED", message: "Receipt encryption failed",
+      details: sdkDetails(error) });
+  }
+  if (error instanceof CheqiSDKError) {
+    const status = error.httpStatusCode;
+    const code: ErrorCode = error.isNetworkError() || error.errorCode === "NETWORK_ERROR" || error.errorCode === "TIMEOUT_ERROR"
+      ? "NETWORK_ERROR" : !(error instanceof CheqiApiError) ? "INTERNAL_ERROR" : status === 429 ? "RATE_LIMITED"
+        : status === 401 || status === 403 ? "AUTH_INVALID"
+          : status === 408 || status >= 500 ? "API_UNAVAILABLE"
+            : status >= 400 && status < 500 ? "API_REJECTED" : "INTERNAL_ERROR";
+    return new AppError({ code, message: safeSdkMessage(code), retryable: ["NETWORK_ERROR", "RATE_LIMITED", "API_UNAVAILABLE"].includes(code),
+      details: { ...sdkDetails(error), ...(code === "RATE_LIMITED" && lastRetryAfterSeconds !== undefined ? { retryAfterSeconds: lastRetryAfterSeconds } : {}) } });
+  }
+  if (error instanceof Error && error.name === "FetchError") {
+    return new AppError({ code: "NETWORK_ERROR", message: "Network request failed", retryable: true });
+  }
+  if (error instanceof Error && error.name === "ResponseError" && "response" in error) {
+    const response = (error as Error & { response: Response }).response;
+    const status = response.status;
+    const code: ErrorCode = status === 429 ? "RATE_LIMITED" : status === 401 || status === 403 ? "AUTH_INVALID"
+      : status === 408 || status >= 500 ? "API_UNAVAILABLE" : "API_REJECTED";
+    return new AppError({ code, message: safeSdkMessage(code), retryable: ["RATE_LIMITED", "API_UNAVAILABLE"].includes(code),
+      details: { httpStatus: status, ...(response.headers.get("x-correlation-id") ? { correlationId: response.headers.get("x-correlation-id") } : {}),
+        ...(code === "RATE_LIMITED" && response.headers.get("retry-after") !== null && Number.isFinite(Number(response.headers.get("retry-after")))
+          ? { retryAfterSeconds: Number(response.headers.get("retry-after")) } : {}) } });
+  }
+  if (error instanceof Error && error.name === "RequiredError") {
+    return new AppError({ code: "INPUT_INVALID", message: "A required SDK field is missing" });
+  }
+  if (isNodeError(error) && ["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "ENOTFOUND", "EAI_AGAIN"].includes(error.code as string)) {
+    return new AppError({ code: "NETWORK_ERROR", message: "Network request failed", retryable: true });
+  }
+  if (error instanceof TypeError && /fetch|network/i.test(error.message)) {
+    return new AppError({ code: "NETWORK_ERROR", message: "Network request failed", retryable: true });
+  }
   return new AppError({
-    code: "INPUT_INVALID",
-    message: error instanceof Error ? error.message : String(error)
+    code: "INTERNAL_ERROR",
+    message: "Unexpected CLI error"
   });
+}
+
+function sdkDetails(error: CheqiSDKError): Record<string, unknown> {
+  return {
+    ...(error.httpStatusCode > 0 ? { httpStatus: error.httpStatusCode } : {}),
+    ...(error.correlationId ? { correlationId: error.correlationId } : {}),
+    ...(error.errorCode ? { sdkErrorCode: error.errorCode } : {})
+  };
+}
+
+function safeSdkMessage(code: ErrorCode): string {
+  switch (code) {
+    case "NETWORK_ERROR": return "Network request failed";
+    case "RATE_LIMITED": return "Cheqi API rate limit reached";
+    case "API_UNAVAILABLE": return "Cheqi API is temporarily unavailable";
+    case "API_REJECTED": return "Cheqi API rejected the request";
+    case "AUTH_INVALID": return "Cheqi API rejected authentication";
+    default: return "Unexpected SDK error";
+  }
 }
 
 function env(name: string): string | null {

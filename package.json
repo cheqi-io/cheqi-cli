@@ -1,6 +1,6 @@
 {
   "name": "@cheqi/cli",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "description": "Cheqi CLI for agent-friendly encrypted receipt workflows",
   "license": "MIT",
   "author": "Cheqi",
@@ -26,13 +26,16 @@
   },
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "skill/cheqi/SKILL.md"
   ],
   "publishConfig": {
     "access": "public"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "prebuild": "npm run generate:skill",
+    "build": "tsc -p tsconfig.json && node scripts/copy-skill.mjs",
+    "generate:skill": "node scripts/generate-skill.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node ./dist/index.js schema session create > /dev/null && node ./dist/index.js schema receipts submit > /dev/null && node ./dist/index.js schema receipts submit-download > /dev/null && node --test test/*.test.js",
     "prepublishOnly": "npm test"

@@ -100,11 +100,11 @@ test("agentic session workflow builds an incremental receipt draft", async () =>
   assert.equal(addResult.totals.totalAmount, 200);
   assert.equal(validation.valid, true);
   assert.deepEqual(validation.nextStep.command, ["receipt", "finalize"]);
-  assert.equal(preview.session.identificationDetails.cardDetails.paymentAccountReference, "par-123");
-  assert.equal(preview.session.receipt.products.length, 1);
-  assert.equal(preview.session.receipt.taxes[0].amount, 34.71);
-  assert.equal(otherPreview.session.receipt.documentNumber, "INV-002");
-  assert.equal(otherPreview.session.receipt.products[0].name, "Socks");
+  assert.equal(preview.draft.identificationDetails.cardDetails.paymentAccountReference, "par-123");
+  assert.equal(preview.draft.receipt.products.length, 1);
+  assert.equal(preview.draft.receipt.taxes[0].amount, 34.71);
+  assert.equal(otherPreview.draft.receipt.documentNumber, "INV-002");
+  assert.equal(otherPreview.draft.receipt.products[0].name, "Socks");
 
   const rawSession = await readFile(join(cwd, ".cheqi/sessions/agent-a.json"), "utf8");
   assert.equal(JSON.parse(rawSession).receipt.documentNumber, "INV-001");
@@ -153,7 +153,7 @@ test("payment-type-only identification is accepted for download-link receipts", 
   assert.equal(initResult.hasMatch, true);
   assert.deepEqual(initResult.nextStep.command, ["receipt", "add-product"]);
   assert.equal(validation.valid, true);
-  assert.deepEqual(preview.session.identificationDetails, { paymentType: "CASH" });
+  assert.deepEqual(preview.draft.identificationDetails, { paymentType: "CASH" });
   assert.equal(status.hasMatch, true);
   assert.deepEqual(status.nextStep.command, ["receipt", "validate"]);
 });
@@ -194,8 +194,8 @@ test("payment-type-only session match resolves the download fallback route", asy
     assert.equal(match.deliveryRouteType, "DOWNLOAD_FALLBACK");
     assert.equal(match.matchId, "match-empty");
     assert.equal(match.recipientCount, 0);
-    assert.deepEqual(preview.session.identificationDetails, { paymentType: "CARD_PAYMENT" });
-    assert.equal(preview.session.matchResponse.matchId, "match-empty");
+    assert.deepEqual(preview.draft.identificationDetails, { paymentType: "CARD_PAYMENT" });
+    assert.equal(preview.draft.matchResponse.matchId, "match-empty");
     assert.deepEqual(requests, [{ url: "/recipient/resolve", body: { paymentType: "CARD_PAYMENT" } }]);
   } finally {
     await new Promise((resolveClose, rejectClose) => {
@@ -280,6 +280,12 @@ test("finalize matches and issues a definitive encrypted download receipt", asyn
     assert.deepEqual(requests[0].body, { paymentType: "CARD_PAYMENT" });
     assert.equal(requests[1].url, "/receipt/download");
     assert.equal(typeof requests[1].body.ciphertext, "string");
+    const repeat = await run(cwd, ["receipt", "finalize", "--session", "empty-finalize"]);
+    assert.equal(repeat.alreadyFinalized, true);
+    assert.equal(repeat.downloadUrl, result.downloadUrl);
+    assert.equal(requests.length, 2);
+    const saved = await readFile(join(cwd, ".cheqi/sessions/empty-finalize.json"), "utf8");
+    assert.equal(saved.includes("downloadUrl"), false);
   } finally {
     await new Promise((resolveClose, rejectClose) => {
       server.close((error) => error ? rejectClose(error) : resolveClose());
@@ -329,6 +335,7 @@ test("subcommand help returns schema", async () => {
 
 test("auth error codes are structured", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "cheqi-cli-auth-"));
+  await run(cwd, ["session", "create", "--session", "missing"]);
   const required = await runFailure(cwd, ["receipt", "finalize", "--session", "missing"]);
   const conflict = await runFailure(cwd, [
     "receipt",
@@ -510,19 +517,17 @@ test("receipts submit exposes recovery data for an uncertain digital submission"
   await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
 
   try {
-    const result = await run(cwd, [
+    const result = await runFailure(cwd, [
       "receipts", "submit", "--receipt", receiptPath,
       "--match-by", "email", "--match-value", "buyer@example.test",
       "--api-key", "sk_test_x",
       "--endpoint", `http://127.0.0.1:${server.address().port}`,
       "--download-base-url", "https://receipt.example.test"
     ]);
-    assert.equal(result.accepted, false);
-    assert.equal(result.state, "DIGITAL_PENDING");
+    assert.equal(result.code, "RECEIPT_PENDING");
     assert.equal(result.retryable, true);
-    assert.equal(result.matchId, "match-pending");
-    assert.equal(result.preparedDownload.downloadUrl, result.downloadUrl);
-    assert.equal(result.preparedDownload.uploadRequest.downloadId, result.downloadId);
+    assert.equal(result.details.state, "DIGITAL_PENDING");
+    assert.equal(result.details.matchId, "match-pending");
     assert.deepEqual(requests, ["/recipient/resolve", "/receipt/encrypted"]);
   } finally {
     await new Promise((resolveClose) => server.close(resolveClose));
@@ -632,8 +637,7 @@ test("submit-download issues a client-encrypted download link end to end", async
   }
 });
 
-test("submit-download preserves the prepared upload after a retryable failure", async () => {
-  const { decryptDownloadEnvelope, parseDownloadUrl } = await import("@cheqi/sdk/download");
+test("submit-download hides an unaccepted download URL after a retryable failure", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "cheqi-cli-download-retry-"));
   const receiptPath = join(cwd, "receipt.json");
   await writeFile(receiptPath, JSON.stringify(definitiveReceiptFixture("INV-RETRY-1")));
@@ -650,21 +654,17 @@ test("submit-download preserves the prepared upload after a retryable failure", 
   await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
 
   try {
-    const result = await run(cwd, [
+    const result = await runFailure(cwd, [
       "receipts", "submit-download", "--receipt", receiptPath,
       "--api-key", "sk_test_x",
       "--endpoint", `http://127.0.0.1:${server.address().port}`,
       "--download-base-url", "https://receipt.example.test"
     ]);
-    assert.equal(result.accepted, false);
-    assert.equal(result.state, "DOWNLOAD_FALLBACK");
+    assert.equal(result.code, "NETWORK_ERROR");
+    assert.equal(result.details.state, "DOWNLOAD_FALLBACK");
     assert.equal(result.retryable, true);
-    assert.equal(result.preparedDownload.downloadUrl, result.downloadUrl);
-    assert.deepEqual(requests, Array(requests.length).fill(result.preparedDownload.uploadRequest));
-    const { downloadId, contentKey } = parseDownloadUrl(result.downloadUrl);
-    assert.equal(result.preparedDownload.uploadRequest.downloadId, downloadId);
-    const envelope = await decryptDownloadEnvelope(result.preparedDownload.uploadRequest.ciphertext, contentKey);
-    assert.equal(JSON.parse(envelope.documents.RECEIPT_PAYLOAD.content).documentNumber, "INV-RETRY-1");
+    assert.equal(JSON.stringify(result).includes("downloadUrl"), false);
+    assert.ok(requests.length > 0);
   } finally {
     await new Promise((resolveClose) => server.close(resolveClose));
   }

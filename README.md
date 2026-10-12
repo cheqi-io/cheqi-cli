@@ -2,7 +2,7 @@
 
 Agent-friendly CLI wrapper around `@cheqi/sdk`.
 
-The CLI uses the SDK 2.2.1 definitive receipt flow: it resolves a delivery route from the supplied identification details, encrypts the exact merchant-supplied receipt payload for that route, and issues it without a server-side receipt-template step.
+The CLI uses the SDK 2.5.0 definitive receipt flow: it resolves a delivery route from the supplied identification details, encrypts the exact merchant-supplied receipt payload for that route, and issues it without a server-side receipt-template step.
 
 Every command returns a JSON envelope on stdout:
 
@@ -12,7 +12,7 @@ Every command returns a JSON envelope on stdout:
   "data": {},
   "meta": {
     "durationMs": 12,
-    "version": "0.3.1"
+    "version": "0.4.0"
   }
 }
 ```
@@ -32,7 +32,7 @@ Failures use the same shape and include stable error codes:
   },
   "meta": {
     "durationMs": 4,
-    "version": "0.3.1"
+    "version": "0.4.0"
   }
 }
 ```
@@ -57,7 +57,11 @@ cheqi receipt preview --session agent-a
 CHEQI_API_KEY=sk_... cheqi receipt finalize --session agent-a
 ```
 
-Drafts are stored locally in `.cheqi/sessions/<session-id>.json`. Sessions are always explicit; pass `--session` on every command so concurrent agents do not share implicit state.
+Drafts are stored locally in `.cheqi/sessions/<session-id>.json`. Set `CHEQI_SESSIONS_DIR` or pass `--sessions-dir` to place them elsewhere. Session responses return the absolute file path. Sessions are always explicit; pass `--session` on every command so concurrent agents do not share implicit state. Session IDs must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`.
+
+`session status` reports `issueState`: `DRAFT`, `DIGITAL_PENDING`, `DIGITAL_SUBMITTED`, `DIGITAL_EXPIRED`, `DOWNLOAD_FALLBACK`, or `EMAIL_FALLBACK`. Finalization freezes the definitive payload. A retry while pending calls the SDK's `resumeReceipt()` with the saved payload and match ID; a settled session makes no network request. Use `receipt finalize --session <id> --fallback download` after expiry when a prepared download is available. The prepared download and its secret URL live in a separate mode `0600` `<id>.download.json` file until the receipt settles. Protect the sessions directory accordingly.
+
+Use `receipt list-products --session <id>` to inspect lines and `receipt remove-product --session <id> --line <identifier|one-based-index>` to remove one before finalization. Edits after finalization starts return `SESSION_FINALIZED`.
 
 To call the Cheqi matching service before adding products:
 
@@ -80,6 +84,8 @@ CHEQI_API_KEY=sk_... npx @cheqi/cli receipts submit \
 
 Use `--receipt -` to read the receipt JSON from stdin.
 
+Run `cheqi receipts validate --receipt receipt.json` first to check a complete payload locally without authentication or a network request.
+
 The JSON file must be a definitive SDK 2.5.0 `ReceiptPayload`. In particular, provide `issueDate`, all receipt totals, `taxesApplied`, and complete product values including `identifier`, `unitCode`, `subtotal`, and `total`. The CLI validates and normalizes the payload but does not infer missing merchant values.
 
 For an anonymous matched flow that should resolve to a download fallback, use `--match-by payment_type --match-value CASH` (or `CARD_PAYMENT` / `DIRECT_DEBIT`).
@@ -94,7 +100,7 @@ CHEQI_API_KEY=sk_... npx @cheqi/cli receipts submit-download \
 
 The successful result includes `deliveryRouteType: "DOWNLOAD_FALLBACK"` and a `downloadUrl`. The URL fragment contains the decryption key; render or hand it to the customer and do not log it server-side.
 
-Receipt results also include `state` and `retryable`. If `accepted` is false and `preparedDownload` is present, retain the entire `preparedDownload` object (including its URL and encrypted upload request). The SDK can retry that exact upload with `receiptService.uploadPreparedDownload(preparedDownload)`. Do not give the URL to the customer until the upload is accepted. For `DIGITAL_PENDING`, retain `matchId` and check the original match with the SDK before attempting another submission.
+Receipt results include `state`, `retryable`, and sometimes `retryAfterSeconds`. `DIGITAL_PENDING` returns a `RECEIPT_PENDING` error with the original `matchId`. For direct submissions, use `cheqi receipts resume --match-id <id> --receipt <same-file>` with exactly the original payload. For a session, retry `receipt finalize --session <id>`; it resumes automatically. A download URL is only customer-ready after acceptance. The SDK does not expose a public full prepare step for `receipts submit-download`, so an uncertain direct upload cannot be persisted before its first request by this CLI.
 
 ## Machine-Readable Schema
 
@@ -107,6 +113,36 @@ cheqi receipt add-product --help
 ```
 
 Schema entries include `flags`, `positional`, and `responseSchema` so an agent can construct commands and validate expected output without probing the command first.
+
+Run `cheqi skill` for the bundled agent skill as a JSON envelope, `cheqi skill --raw` for plain Markdown, or `cheqi skill install [--dir <skills-directory>]` to write `cheqi/SKILL.md` under `.claude/skills` by default. Use `--force` to replace a newer installed skill.
+
+## Errors and retries
+
+Exit `0` means success. Retryable failures exit `4`; authentication failures exit `3`; command, flag, and session usage failures exit `2`; other failures exit `1`. Every failure remains one JSON envelope on stdout. API error details can include `httpStatus`, `correlationId`, `sdkErrorCode`, and `retryAfterSeconds`.
+
+| Code | Retryable | Exit | Meaning |
+| --- | --- | ---: | --- |
+| `AUTH_REQUIRED` | no | 3 | Authentication is required. |
+| `AUTH_CONFLICT` | no | 3 | Choose one authentication method. |
+| `COMMAND_NOT_FOUND` | no | 2 | The command does not exist. |
+| `ENV_UNSUPPORTED` | no | 2 | The environment is unsupported. |
+| `FLAG_INVALID` | no | 2 | A flag or value is invalid. |
+| `FLAG_REQUIRED` | no | 2 | A required flag is missing. |
+| `INPUT_INVALID` | no | 2 | Input cannot be parsed. |
+| `RECEIPT_INVALID` | no | 1 | Receipt content is invalid. |
+| `SESSION_INVALID` | no | 2 | The session ID or file is invalid. |
+| `SESSION_NOT_FOUND` | no | 1 | The session does not exist. |
+| `NETWORK_ERROR` | yes | 4 | The network request failed or timed out. |
+| `RATE_LIMITED` | yes | 4 | The API rate limit was reached. |
+| `API_UNAVAILABLE` | yes | 4 | The API timed out or is unavailable. |
+| `API_REJECTED` | no | 1 | The API rejected the request. |
+| `AUTH_INVALID` | no | 3 | The API rejected authentication. |
+| `ENCRYPTION_FAILED` | no | 1 | Local receipt encryption failed. |
+| `INTERNAL_ERROR` | no | 1 | An unexpected CLI error occurred. |
+| `RECEIPT_PENDING` | yes | 4 | Submission is uncertain; resume the original match. |
+| `RECEIPT_EXPIRED` | no | 1 | The original digital match expired. |
+| `SESSION_FINALIZED` | no | 2 | The receipt payload is frozen. |
+| `SESSION_LOCKED` | yes | 4 | The session is busy; retry shortly. |
 
 Operational responses include a structured `nextStep` when another command is expected:
 
@@ -139,12 +175,12 @@ Do not set both for the same command.
 
 The GitHub Actions `Publish npm package` workflow publishes `@cheqi/cli` to npm. Run it manually with:
 
-- `version`: the package version to publish, for example `0.3.1`
+- `version`: the package version to publish, for example `0.4.0`
 - `dist-tag`: `latest` or `next`
 
 Before the CLI can be published, `@cheqi/sdk` must already exist on npm at a compatible version. Configure the repository secret `NPM_TOKEN` with publish access for the `@cheqi/cli` package.
 
 ```bash
 npm view @cheqi/sdk@2.5.0 version
-npm view @cheqi/cli@0.3.1 version
+npm view @cheqi/cli@0.4.0 version
 ```
