@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdtemp, readFile, writeFile, stat } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile, stat, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createServer } from "node:http";
@@ -56,7 +56,79 @@ test("network failures on match, finalize and submit are retryable and never ech
     assert.equal(result.envelope.error.code, "NETWORK_ERROR");
     assert.equal(result.envelope.error.retryable, true);
     assert.ok(!result.stdout.includes(key));
+    if (args[0] === "receipts") assert.deepEqual(result.envelope.error.details.nextStep.command, ["receipts", "submit"]);
   }
+});
+
+test("a matching outage leaves the session draft and retry can deliver digitally", async () => {
+  const cwd = await temp();
+  const { publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const key = publicKey.export({ type: "spki", format: "der" }).toString("base64");
+  let matchingAttempts = 0;
+  const requests = [];
+  const server = await stub((req, res) => {
+    requests.push(req.url); req.resume(); req.on("end", () => {
+      res.setHeader("content-type", "application/json");
+      if (req.url === "/recipient/resolve" && ++matchingAttempts === 1) {
+        res.statusCode = 503; res.end('{"message":"temporary outage"}');
+      } else if (req.url === "/recipient/resolve") {
+        res.end(JSON.stringify({ routeFound: true, deliveryRouteType: "DIGITAL", matchId: "match-recovered",
+          recipients: [{ id: "device-1", publicKey: key }] }));
+      } else if (req.url === "/receipt/encrypted") {
+        res.statusCode = 201;
+        res.end(JSON.stringify({ cheqiReceiptId: "CHQ-RECOVERED", matchId: "match-recovered", status: "PENDING" }));
+      } else { res.statusCode = 404; res.end("{}"); }
+    });
+  });
+  try {
+    await okay(cwd, ["session", "create", "--session", "match-retry", "--email", "buyer@example.test"]);
+    await okay(cwd, ["receipt", "add-product", "--session", "match-retry", "--name", "Coffee", "--unit-price", "10", "--vat", "21"]);
+    const args = ["receipt", "finalize", "--session", "match-retry", "--api-key", "sk_test", "--endpoint", server.endpoint];
+    const first = await command(cwd, args);
+    assert.equal(first.exit, 4, first.stdout);
+    assert.equal(first.envelope.error.code, "NETWORK_ERROR");
+    assert.deepEqual(first.envelope.error.details.nextStep.command, ["receipt", "finalize"]);
+    const saved = JSON.parse(await readFile(join(cwd, ".cheqi/sessions/match-retry.json"), "utf8"));
+    assert.equal(saved.issue.state, "DRAFT");
+    assert.ok(saved.issue.payload);
+    await assert.rejects(stat(join(cwd, ".cheqi/sessions/match-retry.download.json")), { code: "ENOENT" });
+    const second = await okay(cwd, args);
+    assert.equal(second.state, "DIGITAL_SUBMITTED");
+    assert.equal(second.cheqiReceiptId, "CHQ-RECOVERED");
+    assert.deepEqual(requests, ["/recipient/resolve", "/recipient/resolve", "/receipt/encrypted"]);
+  } finally { await server.close(); }
+});
+
+test("an uncertain download upload keeps its prepared ID and retries the upload", async () => {
+  const cwd = await temp();
+  const requests = [];
+  let uploads = 0;
+  const server = await stub((req, res) => {
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", () => {
+      requests.push({ url: req.url, body: body ? JSON.parse(body) : null });
+      res.setHeader("content-type", "application/json");
+      if (req.url === "/recipient/resolve") res.end(JSON.stringify({ routeFound: true,
+        deliveryRouteType: "DOWNLOAD_FALLBACK", matchId: "match-download", recipients: [] }));
+      else if (req.url === "/receipt/download" && ++uploads <= 4) { res.statusCode = 503; res.end("{}"); }
+      else { res.statusCode = 201; res.end(JSON.stringify({ cheqiReceiptId: "CHQ-DOWNLOAD" })); }
+    });
+  });
+  try {
+    await okay(cwd, ["session", "create", "--session", "download", "--payment-type", "CASH"]);
+    await okay(cwd, ["receipt", "add-product", "--session", "download", "--name", "Coffee", "--unit-price", "10", "--vat", "21"]);
+    const args = ["receipt", "finalize", "--session", "download", "--api-key", "sk_test", "--endpoint", server.endpoint];
+    const first = await command(cwd, args);
+    assert.equal(first.envelope.error.code, "NETWORK_ERROR");
+    assert.deepEqual(first.envelope.error.details.nextStep.command, ["receipt", "finalize"]);
+    const saved = JSON.parse(await readFile(join(cwd, ".cheqi/sessions/download.json"), "utf8"));
+    assert.equal(saved.issue.state, "DOWNLOAD_FALLBACK");
+    const second = await okay(cwd, args);
+    assert.equal(second.cheqiReceiptId, "CHQ-DOWNLOAD");
+    assert.deepEqual(requests.map(({ url }) => url), ["/recipient/resolve", ...Array(5).fill("/receipt/download")]);
+    for (const request of requests.slice(2)) assert.deepEqual(request.body, requests[1].body);
+  } finally { await server.close(); }
 });
 
 test("HTTP errors map to stable codes, status, correlation and Retry-After", async () => {
@@ -200,12 +272,50 @@ test("strict flags, session IDs, product names and help follow the schema", asyn
   }
   const badId = await command(cwd, ["session", "create", "--session", "agent a"]);
   assert.equal(badId.envelope.error.code, "SESSION_INVALID");
+  const negative = await command(cwd, ["receipt", "add-product", "--session", "parse", "--name", "Refund", "--price-incl", "3", "--quantity", "-2"]);
+  assert.equal(negative.envelope.error.code, "FLAG_INVALID");
+  assert.equal(negative.envelope.error.details.flag, "quantity");
+  const invalidFallback = await command(cwd, ["receipt", "finalize", "--session", "parse", "--fallback", "download"]);
+  assert.equal(invalidFallback.envelope.error.code, "FLAG_INVALID");
+  assert.equal(invalidFallback.envelope.error.details.state, "DRAFT");
   const help = await okay(cwd, ["receipt", "add-product", "--session", "parse", "--help"]);
   assert.deepEqual(help.commands[0].command, ["receipt", "add-product"]);
   const added = await okay(cwd, ["receipt", "add-product", "--session", "parse", "Coffee: large", "--price-incl", "3"]);
   assert.equal(added.added.name, "Coffee: large");
   const schema = await okay(cwd, ["schema"]);
   for (const entry of schema.commands) for (const flag of entry.flags) { assert.ok(flag.type); assert.ok(flag.description); }
+});
+
+test("a stale lock held by a live process cannot be stolen", async () => {
+  const cwd = await temp();
+  await okay(cwd, ["session", "create", "--session", "lock"]);
+  const lock = join(cwd, ".cheqi/sessions/lock.json.lock");
+  await writeFile(lock, JSON.stringify({ pid: process.pid }));
+  const old = new Date(Date.now() - 120_000);
+  await utimes(lock, old, old);
+  const blocked = await command(cwd, ["receipt", "add-product", "--session", "lock", "--name", "Coffee", "--price-incl", "1"]);
+  assert.equal(blocked.exit, 4, blocked.stdout);
+  assert.equal(blocked.envelope.error.code, "SESSION_LOCKED");
+  assert.equal(JSON.parse(await readFile(lock, "utf8")).pid, process.pid);
+  await writeFile(lock, JSON.stringify({ pid: 999_999_999 }));
+  await utimes(lock, old, old);
+  const added = await okay(cwd, ["receipt", "add-product", "--session", "lock", "--name", "Coffee", "--price-incl", "1"]);
+  assert.equal(added.added.name, "Coffee");
+});
+
+test("direct expiry does not suggest session fallback", async () => {
+  const cwd = await temp();
+  const file = join(cwd, "receipt.json"); await writeFile(file, JSON.stringify(fixture()));
+  const server = await stub((req, res) => { req.resume(); req.on("end", () => {
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ matchId: "match-direct-expired", state: "EXPIRED" }));
+  }); });
+  try {
+    const result = await command(cwd, ["receipts", "resume", "--match-id", "match-direct-expired", "--receipt", file,
+      "--api-key", "sk_test", "--endpoint", server.endpoint]);
+    assert.equal(result.envelope.error.code, "RECEIPT_EXPIRED");
+    assert.equal(result.envelope.error.details.nextStep, undefined);
+  } finally { await server.close(); }
 });
 
 test("session directory, locking, edit commands and direct validation work", async () => {

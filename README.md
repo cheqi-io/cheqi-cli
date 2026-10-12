@@ -61,6 +61,8 @@ Drafts are stored locally in `.cheqi/sessions/<session-id>.json`. Set `CHEQI_SES
 
 `session status` reports `issueState`: `DRAFT`, `DIGITAL_PENDING`, `DIGITAL_SUBMITTED`, `DIGITAL_EXPIRED`, `DOWNLOAD_FALLBACK`, or `EMAIL_FALLBACK`. Finalization freezes the definitive payload. A retry while pending calls the SDK's `resumeReceipt()` with the saved payload and match ID; a settled session makes no network request. Use `receipt finalize --session <id> --fallback download` after expiry when a prepared download is available. The prepared download and its secret URL live in a separate mode `0600` `<id>.download.json` file until the receipt settles. Protect the sessions directory accordingly.
 
+If customer matching fails before a route is resolved, the session stays `DRAFT` and a retry attempts matching again. An uncertain download upload keeps its prepared upload for a retry. A lock older than 60 seconds is taken over only when its recorded process is no longer alive, so a long finalize retains its lock.
+
 Use `receipt list-products --session <id>` to inspect lines and `receipt remove-product --session <id> --line <identifier|one-based-index>` to remove one before finalization. Edits after finalization starts return `SESSION_FINALIZED`.
 
 To call the Cheqi matching service before adding products:
@@ -101,6 +103,8 @@ CHEQI_API_KEY=sk_... npx @cheqi/cli receipts submit-download \
 The successful result includes `deliveryRouteType: "DOWNLOAD_FALLBACK"` and a `downloadUrl`. The URL fragment contains the decryption key; render or hand it to the customer and do not log it server-side.
 
 Receipt results include `state`, `retryable`, and sometimes `retryAfterSeconds`. `DIGITAL_PENDING` returns a `RECEIPT_PENDING` error with the original `matchId`. For direct submissions, use `cheqi receipts resume --match-id <id> --receipt <same-file>` with exactly the original payload. For a session, retry `receipt finalize --session <id>`; it resumes automatically. A download URL is only customer-ready after acceptance. The SDK does not expose a public full prepare step for `receipts submit-download`, so an uncertain direct upload cannot be persisted before its first request by this CLI.
+
+The direct flow has no saved download fallback after `RECEIPT_EXPIRED`; check the original outcome before starting another receipt. `receipt add-product` requires a positive quantity. `--fallback download` is available only after digital expiry or for a saved uncertain download upload.
 
 ## Machine-Readable Schema
 

@@ -10,3 +10,4 @@
 - Breaking: receipt preview now returns an absolute session file path in `session` and the full local state in `draft`.
 - Adopt SDK 2.5.0 result states and options-object authentication. Pending session finalization resumes the original match and saved payload. Prepared downloads are stored in mode `0600` sidecar files.
 - Add strict schema-driven flags, configurable sessions directory, per-session locks, product list and remove commands, direct receipt validation and resume commands, and the generated Cheqi agent skill.
+- A recoverable matching outage leaves a session in `DRAFT`, allowing a retry to find the customer's digital route. Long finalizations retain their locks while the owning process is alive. Direct expiry no longer suggests a session fallback, draft fallback requests fail clearly, uncertain uploads include a recovery hint, and product quantities must be positive.

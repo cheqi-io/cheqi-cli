@@ -19,7 +19,9 @@ Use the CLI to issue or validate Cheqi digital receipts from a shell. Every ordi
 
 - Never log, persist, or echo a `downloadUrl` yourself. Its URL fragment is the decryption key. Only show an accepted link to the customer.
 - When `RECEIPT_PENDING` comes from a session, wait `retryAfterSeconds` if given and retry `receipt finalize --session <id>`. It resumes the saved match and payload.
+- When customer matching fails before a route is resolved, the session stays `DRAFT`. Retry finalize to attempt digital matching again; an unaccepted QR URL is not shown.
 - When `RECEIPT_PENDING` comes from `receipts submit`, use `receipts resume --match-id <id> --receipt <same path|->` with the exact original payload.
+- A direct flow has no saved download fallback after `RECEIPT_EXPIRED`. Check the original outcome before starting a new receipt.
 - Default to `sandbox`. Prefer `CHEQI_API_KEY` or `CHEQI_ACCESS_TOKEN` over putting secrets in command arguments.
 - Retry `NETWORK_ERROR`, `RATE_LIMITED`, `API_UNAVAILABLE`, `RECEIPT_PENDING`, and `SESSION_LOCKED` with backoff. Respect `retryAfterSeconds`.
 - Fix flags, session IDs, and receipt content for input errors. Stop and ask a human for invalid authentication, encryption failure, or an unexpected internal error.
