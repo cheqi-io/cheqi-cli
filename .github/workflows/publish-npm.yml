@@ -34,7 +34,8 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '24'
-          registry-url: 'https://registry.npmjs.org'
+          # registry-url writes an empty auth token when NODE_AUTH_TOKEN is unset,
+          # preventing npm from using the GitHub OIDC identity for publishing.
 
       - name: Install npm for trusted publishing
         run: npm install -g npm@^11.5.1

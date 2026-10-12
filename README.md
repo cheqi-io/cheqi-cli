@@ -182,7 +182,7 @@ The GitHub Actions `Publish npm package` workflow publishes `@cheqi/cli` to npm.
 - `version`: the package version to publish, for example `0.4.0`
 - `dist-tag`: `latest` or `next`
 
-Before publishing, `@cheqi/sdk` must already exist on npm at a compatible version. In the npm settings for `@cheqi/cli`, configure a GitHub Actions trusted publisher with organization `cheqi-io`, repository `cheqi-cli`, workflow filename `publish-npm.yml`, and permission to run `npm publish`. The workflow uses GitHub's OIDC token; no `NPM_TOKEN` repository secret is needed. npm requires the repository and workflow names to match this setting exactly.
+Before publishing, `@cheqi/sdk` must already exist on npm at a compatible version. In the npm settings for `@cheqi/cli`, configure a GitHub Actions trusted publisher with organization `cheqi-io`, repository `cheqi-cli`, workflow filename `publish-npm.yml`, and permission to run `npm publish`. If the trusted publisher still names the old `cli` repository, replace that entry. The workflow uses GitHub's OIDC token; no `NPM_TOKEN` repository secret is needed. npm requires the repository and workflow names to match this setting exactly.
 
 ```bash
 npm view @cheqi/sdk@2.5.0 version
