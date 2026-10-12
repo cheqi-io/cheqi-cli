@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile, open, stat, chmod } from "node:fs/promises";
 import { resolve } from "node:path";
 import { stdin } from "node:process";
@@ -815,15 +816,22 @@ async function withSessionLock(args: string[], handler: (args: string[]) => Prom
   await mkdir(sessionsDir, { recursive: true });
   const lockPath = `${sessionPath(id)}.lock`;
   const deadline = Date.now() + 5000;
+  const staleAfterMs = 60_000;
+  const heartbeatEveryMs = 5_000;
+  const owner = randomUUID();
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   while (!handle) {
     try { handle = await open(lockPath, "wx", 0o600); }
     catch (error) {
       if (!isNodeError(error) || error.code !== "EEXIST") throw error;
       try {
-        if (Date.now() - (await stat(lockPath)).mtimeMs > 60_000 && !(await lockOwnerAlive(lockPath))) {
-          await rm(lockPath, { force: true });
-          continue;
+        const stale = await stat(lockPath);
+        if (Date.now() - stale.mtimeMs > staleAfterMs) {
+          const current = await stat(lockPath);
+          if (current.ino === stale.ino && current.mtimeMs === stale.mtimeMs && Date.now() - current.mtimeMs > staleAfterMs) {
+            await rm(lockPath, { force: true });
+            continue;
+          }
         }
       } catch (statError) { if (!isNodeError(statError) || statError.code !== "ENOENT") throw statError; }
       if (Date.now() >= deadline) throw new AppError({ code: "SESSION_LOCKED", message: "Session is busy; retry shortly", retryable: true,
@@ -831,20 +839,26 @@ async function withSessionLock(args: string[], handler: (args: string[]) => Prom
       await new Promise((done) => setTimeout(done, 30 + Math.floor(Math.random() * 40)));
     }
   }
+  let heartbeat: ReturnType<typeof setInterval> | undefined;
+  let pulse: Promise<void> = Promise.resolve();
   try {
-    await handle.writeFile(JSON.stringify({ pid: process.pid }));
+    await handle.writeFile(JSON.stringify({ owner, pid: process.pid }));
+    heartbeat = setInterval(() => {
+      pulse = handle.utimes(new Date(), new Date());
+      void pulse.catch(() => undefined);
+    }, heartbeatEveryMs);
+    heartbeat.unref();
     return await handler(args);
   }
-  finally { await handle.close(); await rm(lockPath, { force: true }); }
-}
-
-async function lockOwnerAlive(path: string): Promise<boolean> {
-  let pid: unknown;
-  try { pid = (JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>).pid; }
-  catch (error) { if (isNodeError(error) && error.code === "ENOENT") return false; return false; }
-  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
-  try { process.kill(pid, 0); return true; }
-  catch (error) { return !isNodeError(error) || error.code !== "ESRCH"; }
+  finally {
+    if (heartbeat) clearInterval(heartbeat);
+    await pulse.catch(() => undefined);
+    await handle.close();
+    try {
+      const current = JSON.parse(await readFile(lockPath, "utf8")) as Record<string, unknown>;
+      if (current.owner === owner) await rm(lockPath, { force: true });
+    } catch (error) { if (!isNodeError(error) || error.code !== "ENOENT") throw error; }
+  }
 }
 
 // Public receipt-download page per environment (Download Link Contract v1).

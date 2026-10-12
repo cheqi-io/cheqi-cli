@@ -61,7 +61,7 @@ Drafts are stored locally in `.cheqi/sessions/<session-id>.json`. Set `CHEQI_SES
 
 `session status` reports `issueState`: `DRAFT`, `DIGITAL_PENDING`, `DIGITAL_SUBMITTED`, `DIGITAL_EXPIRED`, `DOWNLOAD_FALLBACK`, or `EMAIL_FALLBACK`. Finalization freezes the definitive payload. A retry while pending calls the SDK's `resumeReceipt()` with the saved payload and match ID; a settled session makes no network request. Use `receipt finalize --session <id> --fallback download` after expiry when a prepared download is available. The prepared download and its secret URL live in a separate mode `0600` `<id>.download.json` file until the receipt settles. Protect the sessions directory accordingly.
 
-If customer matching fails before a route is resolved, the session stays `DRAFT` and a retry attempts matching again. An uncertain download upload keeps its prepared upload for a retry. A lock older than 60 seconds is taken over only when its recorded process is no longer alive, so a long finalize retains its lock.
+If customer matching fails before a route is resolved, the session stays `DRAFT` and a retry attempts matching again. An uncertain download upload keeps its prepared upload for a retry. An active session lock is refreshed during long operations; a lock that has not been refreshed for 60 seconds is recovered, even across containers or after PID reuse.
 
 Use `receipt list-products --session <id>` to inspect lines and `receipt remove-product --session <id> --line <identifier|one-based-index>` to remove one before finalization. Edits after finalization starts return `SESSION_FINALIZED`.
 

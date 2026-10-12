@@ -286,21 +286,41 @@ test("strict flags, session IDs, product names and help follow the schema", asyn
   for (const entry of schema.commands) for (const flag of entry.flags) { assert.ok(flag.type); assert.ok(flag.description); }
 });
 
-test("a stale lock held by a live process cannot be stolen", async () => {
+test("a stale lock is recovered even when its PID is live on this machine", async () => {
   const cwd = await temp();
   await okay(cwd, ["session", "create", "--session", "lock"]);
   const lock = join(cwd, ".cheqi/sessions/lock.json.lock");
-  await writeFile(lock, JSON.stringify({ pid: process.pid }));
-  const old = new Date(Date.now() - 120_000);
-  await utimes(lock, old, old);
-  const blocked = await command(cwd, ["receipt", "add-product", "--session", "lock", "--name", "Coffee", "--price-incl", "1"]);
-  assert.equal(blocked.exit, 4, blocked.stdout);
-  assert.equal(blocked.envelope.error.code, "SESSION_LOCKED");
-  assert.equal(JSON.parse(await readFile(lock, "utf8")).pid, process.pid);
-  await writeFile(lock, JSON.stringify({ pid: 999_999_999 }));
+  await writeFile(lock, JSON.stringify({ pid: 1 }));
+  const old = new Date(Date.now() - 300_000);
   await utimes(lock, old, old);
   const added = await okay(cwd, ["receipt", "add-product", "--session", "lock", "--name", "Coffee", "--price-incl", "1"]);
   assert.equal(added.added.name, "Coffee");
+  await assert.rejects(stat(lock), { code: "ENOENT" });
+});
+
+test("an active lock is refreshed during a slow request", async () => {
+  const cwd = await temp();
+  await okay(cwd, ["session", "create", "--session", "slow", "--email", "buyer@example.test"]);
+  const server = await stub((req, res) => {
+    req.resume(); req.on("end", () => setTimeout(() => { res.statusCode = 503; res.end("{}"); }, 6_500));
+  });
+  try {
+    const pending = command(cwd, ["session", "match", "--session", "slow", "--email", "buyer@example.test",
+      "--api-key", "sk_test", "--endpoint", server.endpoint, "--timeout", "15"]);
+    const lock = join(cwd, ".cheqi/sessions/slow.json.lock");
+    let initial;
+    for (let attempt = 0; attempt < 50; attempt++) {
+      try { initial = await stat(lock); break; }
+      catch (error) { if (error.code !== "ENOENT") throw error; await new Promise((done) => setTimeout(done, 50)); }
+    }
+    assert.ok(initial, "the request acquired its session lock");
+    await new Promise((done) => setTimeout(done, 5_500));
+    const refreshed = await stat(lock);
+    assert.ok(refreshed.mtimeMs > initial.mtimeMs + 4_000, "the active lock was refreshed");
+    const result = await pending;
+    assert.equal(result.exit, 4, result.stdout);
+    await assert.rejects(stat(lock), { code: "ENOENT" });
+  } finally { await server.close(); }
 });
 
 test("direct expiry does not suggest session fallback", async () => {
