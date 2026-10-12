@@ -249,7 +249,7 @@ function flag(name: string, type: string, required: boolean, defaultValue?: unkn
     "access-token": "Cheqi access token; prefer CHEQI_ACCESS_TOKEN.", "download-base-url": "Receipt download page base URL.",
     timeout: "Request timeout in seconds.", verbose: "Write SDK diagnostics to stderr.", note: "Receipt note.",
     name: "Product name.", "price-incl": "Gross price per unit including VAT.", "unit-price": "Net price per unit excluding VAT.",
-    quantity: "Number of units.", vat: "VAT rate as a percentage.", "tax-type": "Tax type label.",
+    quantity: "Positive number of units.", vat: "VAT rate as a percentage.", "tax-type": "Tax type label.",
     "unit-code": "Unit of measure code.", brand: "Product brand.", identifier: "Product line identifier or SKU.",
     "tax-label": "Display label for the tax.", receipt: "Receipt JSON path or - for stdin.",
     "match-by": "Customer identifier type.", "match-value": "Customer identifier value.", "match-id": "Original match ID for recovery.",
