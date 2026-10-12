@@ -37,6 +37,23 @@ Failures use the same shape and include stable error codes:
 }
 ```
 
+## Browser login
+
+```bash
+cheqi auth login --env sandbox
+cheqi auth status --env sandbox
+cheqi receipts submit --receipt receipt.json --match-by payment_type --match-value CASH
+cheqi auth logout --env sandbox
+```
+
+`auth login` opens Cheqi's approval page. Sign in and select one company where you are an administrator. The browser redirects to a temporary `127.0.0.1` port opened by the CLI. The CLI checks the authorization state, exchanges the one-time code with PKCE, and saves the company-bound credentials in `~/.config/cheqi/credentials/` with owner-only permissions. A login is tied to its API endpoint; use `--env test` or `--env production` for other environments, or `--endpoint` for a local API. You can preselect a company with `--company-id`.
+
+For a headless shell, pass `--no-browser` and open the authorization URL printed on stderr in a browser on the same computer.
+
+The access token lasts 15 minutes. Commands refresh it automatically and rotate the refresh token before sending API requests. The login expires after 30 days, or sooner if revoked or your company administrator access is removed. Run `cheqi auth login` again then. `auth logout` revokes the backend session and removes local credentials. A new login for the same environment replaces the local session.
+
+Explicit `--api-key`, `--access-token`, `CHEQI_API_KEY`, and `CHEQI_ACCESS_TOKEN` still work and take precedence over saved CLI credentials. Commands emit JSON only on stdout; browser instructions go to stderr.
+
 ## Incremental Session Workflow
 
 ```bash

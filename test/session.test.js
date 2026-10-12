@@ -329,12 +329,13 @@ test("subcommand help returns schema", async () => {
 
 test("auth error codes are structured", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "cheqi-cli-auth-"));
-  const required = await runFailure(cwd, ["receipt", "finalize", "--session", "missing"]);
+  await run(cwd, ["session", "create", "--session", "s1"]);
+  const required = await runFailure(cwd, ["receipt", "finalize", "--session", "s1"]);
   const conflict = await runFailure(cwd, [
     "receipt",
     "finalize",
     "--session",
-    "missing",
+    "s1",
     "--api-key",
     "sk_test",
     "--access-token",

@@ -3,6 +3,7 @@
 import { readFileSync } from "node:fs";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { stdin } from "node:process";
+import { login, logout, savedAccessToken, status } from "./auth.js";
 import {
   CheqiSDK,
   createReceiptPayload,
@@ -152,6 +153,8 @@ async function route(args: string[]): Promise<unknown> {
 
   const [command, ...rest] = args;
   switch (command) {
+    case "auth":
+      return authCommand(rest);
     case "session":
       return sessionCommand(rest);
     case "receipt":
@@ -173,6 +176,35 @@ async function route(args: string[]): Promise<unknown> {
         details: { command }
       });
   }
+}
+
+async function authCommand(args: string[]): Promise<unknown> {
+  const [command, ...rest] = args;
+  if (command === undefined || command === "help" || isHelp(rest)) {
+    return commandSchema(["auth", ...(command && command !== "help" ? [command] : [])]);
+  }
+  const flags = parseFlags(rest);
+  const options = parseAuthOptions(rest);
+  const endpoint = resolveEndpoint(options);
+  switch (command) {
+    case "login":
+      return login(endpoint, stringFlag(flags, "company-id") ?? undefined,
+        booleanFlag(flags, "no-browser"));
+    case "status":
+      return status(endpoint);
+    case "logout":
+      return logout(endpoint);
+    default:
+      throw new AppError({ code: "COMMAND_NOT_FOUND", message: `Unknown auth command: ${command}` });
+  }
+}
+
+async function resolveSavedAuth<T extends AuthOptions>(options: T): Promise<T> {
+  if (!options.apiKey && !options.accessToken) {
+    options.accessToken = await savedAccessToken(resolveEndpoint(options));
+  }
+  validateAuth(options);
+  return options;
 }
 
 async function sessionCommand(args: string[]): Promise<unknown> {
@@ -312,7 +344,6 @@ async function createSession(args: string[]): Promise<unknown> {
 async function matchSession(args: string[]): Promise<unknown> {
   const flags = parseFlags(args);
   const auth = parseAuthOptions(args);
-  validateAuth(auth);
 
   const identificationDetails = identificationDetailsFromFlags(flags);
   if (identificationDetails === null) {
@@ -324,6 +355,9 @@ async function matchSession(args: string[]): Promise<unknown> {
   }
 
   const session = await loadSession(requireSessionId(flags));
+  auth.env = stringFlag(flags, "env") ?? session.auth.env ?? auth.env;
+  auth.endpoint = stringFlag(flags, "endpoint") ?? session.auth.endpoint ?? auth.endpoint;
+  await resolveSavedAuth(auth);
   session.identificationDetails = identificationDetails as unknown as Record<string, unknown>;
   session.auth.env = auth.env;
   session.auth.endpoint = auth.endpoint;
@@ -479,17 +513,15 @@ async function validateSession(args: string[]): Promise<unknown> {
 
 async function finalizeSession(args: string[]): Promise<unknown> {
   const auth = parseAuthOptions(args);
-  validateAuth(auth);
   const flags = parseFlags(args);
   const session = await loadSession(requireSessionId(flags));
+  auth.env = stringFlag(flags, "env") ?? session.auth.env ?? auth.env;
+  auth.endpoint = stringFlag(flags, "endpoint") ?? session.auth.endpoint ?? auth.endpoint;
+  await resolveSavedAuth(auth);
   recomputeTotals(session.receipt);
   validateReadyToFinalize(session);
 
-  const sdk = buildSDK({
-    ...auth,
-    env: stringFlag(flags, "env") ?? session.auth.env ?? auth.env,
-    endpoint: stringFlag(flags, "endpoint") ?? session.auth.endpoint ?? auth.endpoint
-  });
+  const sdk = buildSDK(auth);
 
   const result = await sdk.receiptService.issueReceipt(
     session.identificationDetails as unknown as IdentificationDetails,
@@ -513,6 +545,7 @@ async function resetSession(args: string[]): Promise<unknown> {
 async function submitReceipt(args: string[]): Promise<unknown> {
   const options = parseSubmitOptions(args);
   validateSubmitOptions(options);
+  await resolveSavedAuth(options);
 
   const sdk = buildSDK(options);
   const receipt = definitiveReceipt(await readReceipt(options.receiptPath as string));
@@ -587,7 +620,7 @@ async function submitDownloadReceipt(args: string[]): Promise<unknown> {
   if (!options.receiptPath) {
     throw requiredFlag("receipt");
   }
-  validateAuth(options);
+  await resolveSavedAuth(options);
 
   const sdk = buildSDK(options);
   const receipt = definitiveReceipt(await readReceipt(options.receiptPath));
@@ -657,6 +690,36 @@ function parseSubmitDownloadOptions(args: string[]): SubmitDownloadOptions {
 
 function commandSchema(path: string[] = []): unknown {
   const commands = [
+    {
+      command: ["auth", "login"],
+      summary: "Sign in through the browser and save a company-bound CLI session.",
+      positional: [],
+      flags: [flag("env", "enum", false, "sandbox", ["sandbox", "test", "production"]),
+        flag("endpoint", "string", false), flag("company-id", "string", false),
+        flag("no-browser", "boolean", false, false)],
+      response: "AuthLoginResponse",
+      responseSchema: objectSchema({ companyId: { type: "string" }, scope: { type: "string" },
+        expiresAt: { type: "string", format: "date-time" } }, ["companyId", "scope", "expiresAt"])
+    },
+    {
+      command: ["auth", "status"],
+      summary: "Inspect the saved CLI login for an environment.",
+      positional: [],
+      flags: [flag("env", "enum", false, "sandbox", ["sandbox", "test", "production"]),
+        flag("endpoint", "string", false)],
+      response: "AuthStatusResponse",
+      responseSchema: objectSchema({ loggedIn: { type: "boolean" }, companyId: { type: "string" },
+        scope: { type: "string" }, expiresAt: { type: "string", format: "date-time" } }, ["loggedIn"])
+    },
+    {
+      command: ["auth", "logout"],
+      summary: "Revoke the saved CLI login for an environment.",
+      positional: [],
+      flags: [flag("env", "enum", false, "sandbox", ["sandbox", "test", "production"]),
+        flag("endpoint", "string", false)],
+      response: "AuthLogoutResponse",
+      responseSchema: objectSchema({ loggedOut: { type: "boolean" } }, ["loggedOut"])
+    },
     {
       command: ["session", "create"],
       summary: "Create a local receipt session.",
@@ -1032,7 +1095,6 @@ function validateSubmitOptions(options: SubmitOptions): void {
   if (options.matchValue === null) {
     throw requiredFlag("match-value");
   }
-  validateAuth(options);
 }
 
 function parseAuthOptions(args: string[]): AuthOptions {
@@ -1052,7 +1114,7 @@ function validateAuth(options: Pick<AuthOptions, "apiKey" | "accessToken">): voi
   if (!options.apiKey && !options.accessToken) {
     throw new AppError({
       code: "AUTH_REQUIRED",
-      message: "Set --api-key, --access-token, CHEQI_API_KEY, or CHEQI_ACCESS_TOKEN"
+      message: "Run cheqi auth login, or set --api-key, --access-token, CHEQI_API_KEY, or CHEQI_ACCESS_TOKEN"
     });
   }
   if (options.apiKey && options.accessToken) {
