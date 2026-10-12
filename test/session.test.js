@@ -662,6 +662,7 @@ test("submit-download hides an unaccepted download URL after a retryable failure
     ]);
     assert.equal(result.code, "NETWORK_ERROR");
     assert.equal(result.details.state, "DOWNLOAD_FALLBACK");
+    assert.deepEqual(result.details.nextStep.command, ["receipts", "validate"]);
     assert.equal(result.retryable, true);
     assert.equal(JSON.stringify(result).includes("downloadUrl"), false);
     assert.ok(requests.length > 0);

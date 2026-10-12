@@ -28,6 +28,7 @@ const VERSION = JSON.parse(
 ).version as string;
 const SESSIONS_DIR = ".cheqi/sessions";
 let lastRetryAfterSeconds: number | undefined;
+let lastMatchSucceeded = false;
 let activeCommandPath: string[] = [];
 let sessionsDir = resolve(process.env.CHEQI_SESSIONS_DIR ?? SESSIONS_DIR);
 
@@ -482,6 +483,8 @@ async function addProduct(args: string[]): Promise<unknown> {
   }
 
   const quantity = numberFlag(flags, "quantity") ?? 1;
+  if (quantity <= 0) throw new AppError({ code: "FLAG_INVALID", message: "--quantity must be greater than zero",
+    details: { flag: "quantity", value: quantity } });
   const vatRate = numberFlag(flags, "vat") ?? 0;
   const taxType = stringFlag(flags, "tax-type") ?? "VAT";
   const unitCode = stringFlag(flags, "unit-code") ?? "C62";
@@ -617,8 +620,13 @@ async function finalizeSession(args: string[]): Promise<unknown> {
     return { ...session.issue?.result, ...(sidecar ? { downloadUrl: sidecar.downloadUrl } : {}),
       alreadyFinalized: true, sessionId: session.id, session: sessionPath(session.id) };
   }
+  const fallbackRequested = stringFlag(flags, "fallback") === "download";
+  if (fallbackRequested && state !== "DIGITAL_EXPIRED" && !(state === "DOWNLOAD_FALLBACK" && session.issue?.result?.retryable === true)) {
+    throw new AppError({ code: "FLAG_INVALID", message: "--fallback download requires an expired digital match or an uncertain download upload",
+      details: { flag: "fallback", state } });
+  }
   validateAuth(auth);
-  if (state === "DIGITAL_EXPIRED" && stringFlag(flags, "fallback") !== "download") {
+  if (state === "DIGITAL_EXPIRED" && !fallbackRequested) {
     throw expiredReceipt(session.id);
   }
   if (state === "DRAFT") {
@@ -635,9 +643,10 @@ async function finalizeSession(args: string[]): Promise<unknown> {
     endpoint: stringFlag(flags, "endpoint") ?? session.auth.endpoint ?? auth.endpoint
   });
 
-  if (stringFlag(flags, "fallback") === "download" || (state === "DOWNLOAD_FALLBACK" && session.issue?.result?.retryable === true)) {
+  if (fallbackRequested || (state === "DOWNLOAD_FALLBACK" && session.issue?.result?.retryable === true)) {
     const prepared = await loadPreparedDownload(session.id);
-    if (!prepared) throw expiredReceipt(session.id);
+    if (!prepared) throw new AppError({ code: "INPUT_INVALID", message: "No prepared download is saved for this session",
+      details: { sessionId: session.id, state } });
     const uploaded = await sdk.receiptService.uploadPreparedDownload(prepared, auth.accessToken);
     const data = { success: true, accepted: true, state: "DOWNLOAD_FALLBACK", retryable: false,
       matchId: session.issue?.matchId, cheqiReceiptId: uploaded.cheqiReceiptId,
@@ -653,6 +662,12 @@ async function finalizeSession(args: string[]): Promise<unknown> {
   const result = state === "DIGITAL_PENDING"
     ? await sdk.receiptService.resumeReceipt(session.issue?.matchId as string, payload, { accessToken: auth.accessToken })
     : await sdk.receiptService.issueReceipt(session.identificationDetails as unknown as IdentificationDetails, payload, { accessToken: auth.accessToken });
+  if (state === "DRAFT" && result.state === "DOWNLOAD_FALLBACK" && result.retryable && !lastMatchSucceeded) {
+    await rm(downloadSidecarPath(session.id), { force: true });
+    throw new AppError({ code: "NETWORK_ERROR", message: "Customer matching failed; retry finalize",
+      retryable: true, details: { sessionId: session.id, state: "DRAFT",
+        nextStep: nextStep(["receipt", "finalize"], ["session"], [], "Retry matching with the saved receipt payload.") } });
+  }
   if (result.preparedDownload) await saveDownloadSidecar(session.id, result.preparedDownload);
   else if (result.downloadUrl) await saveDownloadSidecar(session.id, { downloadUrl: result.downloadUrl });
   const data = receiptResultData(result);
@@ -663,8 +678,7 @@ async function finalizeSession(args: string[]): Promise<unknown> {
   if (result.state === "DIGITAL_SUBMITTED") await rm(downloadSidecarPath(session.id), { force: true });
   if (result.state === "DIGITAL_PENDING") throw pendingReceipt(result, ["receipt", "finalize"], session.id);
   if (result.state === "DIGITAL_EXPIRED") throw expiredReceipt(session.id);
-  if (result.retryable && !result.isSuccess()) throw new AppError({ code: "NETWORK_ERROR", message: "Receipt upload is uncertain; retry finalize",
-    retryable: true, details: { sessionId: session.id, state: result.state } });
+  if (result.retryable && !result.isSuccess()) throw uncertainUploadError(result.state, session.id);
 
   return {
     ...data,
@@ -696,10 +710,14 @@ async function submitReceipt(args: string[]): Promise<unknown> {
     receipt,
     { accessToken: options.accessToken }
   );
+  if (result.state === "DOWNLOAD_FALLBACK" && result.retryable && !lastMatchSucceeded) {
+    throw new AppError({ code: "NETWORK_ERROR", message: "Customer matching failed; retry the original submission",
+      retryable: true, details: { nextStep: nextStep(["receipts", "submit"], ["receipt", "match-by", "match-value"], [],
+        "Retry matching with exactly the original receipt payload and customer identifier.") } });
+  }
   if (result.state === "DIGITAL_PENDING") throw pendingReceipt(result, ["receipts", "resume"]);
   if (result.state === "DIGITAL_EXPIRED") throw expiredReceipt();
-  if (result.retryable && !result.isSuccess()) throw new AppError({ code: "NETWORK_ERROR", message: "Receipt upload is uncertain",
-    retryable: true, details: { state: result.state } });
+  if (result.retryable && !result.isSuccess()) throw uncertainUploadError(result.state);
   return receiptResultData(result);
 }
 
@@ -722,6 +740,7 @@ async function resumeDirectReceipt(args: string[]): Promise<unknown> {
   const result = await sdk.receiptService.resumeReceipt(matchId, payload, { accessToken: auth.accessToken });
   if (result.state === "DIGITAL_PENDING") throw pendingReceipt(result, ["receipts", "resume"]);
   if (result.state === "DIGITAL_EXPIRED") throw expiredReceipt();
+  if (result.retryable && !result.isSuccess()) throw uncertainUploadError(result.state);
   return receiptResultData(result);
 }
 
@@ -746,7 +765,20 @@ function pendingReceipt(result: ReceiptResult, command: string[], sessionId?: st
 
 function expiredReceipt(sessionId?: string): AppError {
   return new AppError({ code: "RECEIPT_EXPIRED", message: "The original digital match expired",
-    details: { ...(sessionId ? { sessionId } : {}), nextStep: nextStep(["receipt", "finalize"], ["session", "fallback"], [], "Use --fallback download for the prepared download.") } });
+    details: sessionId
+      ? { sessionId, nextStep: nextStep(["receipt", "finalize"], ["session", "fallback"], [], "Use --fallback download for the prepared download.") }
+      : { hint: "This direct flow has no saved download fallback. Check the original outcome before starting a new receipt." } });
+}
+
+function uncertainUploadError(state: string, sessionId?: string): AppError {
+  return new AppError({ code: "NETWORK_ERROR", message: "Receipt upload is uncertain", retryable: true,
+    details: { state, ...(sessionId ? {
+      sessionId,
+      nextStep: nextStep(["receipt", "finalize"], ["session"], [], "Retry the saved prepared download upload.")
+    } : {
+      nextStep: nextStep(["receipts", "validate"], ["receipt"], [],
+        "Confirm whether the first upload succeeded before issuing again; the direct flow has no saved upload.")
+    }) } });
 }
 
 function withoutSecret(data: Record<string, unknown>): Record<string, unknown> {
@@ -789,15 +821,30 @@ async function withSessionLock(args: string[], handler: (args: string[]) => Prom
     catch (error) {
       if (!isNodeError(error) || error.code !== "EEXIST") throw error;
       try {
-        if (Date.now() - (await stat(lockPath)).mtimeMs > 60_000) { await rm(lockPath, { force: true }); continue; }
+        if (Date.now() - (await stat(lockPath)).mtimeMs > 60_000 && !(await lockOwnerAlive(lockPath))) {
+          await rm(lockPath, { force: true });
+          continue;
+        }
       } catch (statError) { if (!isNodeError(statError) || statError.code !== "ENOENT") throw statError; }
       if (Date.now() >= deadline) throw new AppError({ code: "SESSION_LOCKED", message: "Session is busy; retry shortly", retryable: true,
         details: { sessionId: id } });
       await new Promise((done) => setTimeout(done, 30 + Math.floor(Math.random() * 40)));
     }
   }
-  try { return await handler(args); }
+  try {
+    await handle.writeFile(JSON.stringify({ pid: process.pid }));
+    return await handler(args);
+  }
   finally { await handle.close(); await rm(lockPath, { force: true }); }
+}
+
+async function lockOwnerAlive(path: string): Promise<boolean> {
+  let pid: unknown;
+  try { pid = (JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>).pid; }
+  catch (error) { if (isNodeError(error) && error.code === "ENOENT") return false; return false; }
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return !isNodeError(error) || error.code !== "ESRCH"; }
 }
 
 // Public receipt-download page per environment (Download Link Contract v1).
@@ -866,8 +913,7 @@ async function submitDownloadReceipt(args: string[]): Promise<unknown> {
     receipt,
     options.accessToken
   );
-  if (result.retryable && !result.isSuccess()) throw new AppError({ code: "NETWORK_ERROR", message: "Receipt upload is uncertain",
-    retryable: true, details: { state: result.state } });
+  if (result.retryable && !result.isSuccess()) throw uncertainUploadError(result.state);
   return receiptResultData(result);
 }
 
@@ -959,6 +1005,7 @@ function validateAuth(options: Pick<AuthOptions, "apiKey" | "accessToken">): voi
 
 function buildSDK(options: AuthOptions): CheqiSDK {
   lastRetryAfterSeconds = undefined;
+  lastMatchSucceeded = false;
   return new CheqiSDK({
     apiEndpoint: resolveEndpoint(options),
     apiKey: options.apiKey,
@@ -967,6 +1014,7 @@ function buildSDK(options: AuthOptions): CheqiSDK {
     logger: options.verbose ? new StderrLogger() : new NoopLogger(),
     fetch: async (input, init) => {
       const response = await fetch(input, init);
+      if (new URL(String(input)).pathname.endsWith("/recipient/resolve") && response.ok) lastMatchSucceeded = true;
       if (response.status === 429) {
         const retryAfter = response.headers.get("retry-after");
         const seconds = retryAfter === null ? NaN : Number(retryAfter);
